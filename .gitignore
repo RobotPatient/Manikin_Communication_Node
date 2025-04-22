@@ -30,3 +30,17 @@
 *.exe
 *.out
 *.app
+
+# Python venv for zephyr
+.venv/
+.west/
+zephyr/
+
+# Build folders
+build/
+Build/
+cmake-*
+
+# IDE folders
+.vscode/
+.idea/
