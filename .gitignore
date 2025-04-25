@@ -44,3 +44,6 @@ cmake-*
 # IDE folders
 .vscode/
 .idea/
+
+# Ozone debug files
+*.user
