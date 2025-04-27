@@ -4,8 +4,8 @@
 *                         www.segger.com                             *
 **********************************************************************
 
-File          : 
-Created       : 27 Apr 2025 22:34
+File          : /home/victor/Documents/Manikin_Communication_Node/m4_subimage/m4_debug.jdebug
+Created       : 27 Apr 2025 22:43
 Ozone Version : V3.38f
 */
 
@@ -22,19 +22,18 @@ void OnProjectLoad (void) {
   //
   // Dialog-generated settings
   //
-  Project.AddPathSubstitute ("/home/victor/Documents/Manikin_Communication_Node", "$(ProjectDir)");
-  Project.AddPathSubstitute ("/home/victor/documents/manikin_communication_node", "$(ProjectDir)");
-  Project.SetDevice ("STM32H747XI_M7");
+  Project.AddPathSubstitute ("/home/victor/Documents/Manikin_Communication_Node/m4_subimage", "$(ProjectDir)");
+  Project.AddPathSubstitute ("/home/victor/documents/manikin_communication_node/m4_subimage", "$(ProjectDir)");
+  Project.SetDevice ("STM32H747XI_M4");
   Project.SetHostIF ("USB", "");
   Project.SetTargetIF ("SWD");
   Project.SetTIFSpeed ("4 MHz");
-  Project.AddSvdFile ("$(InstallDir)/Config/CPU/Cortex-M7F.svd");
+  Project.AddSvdFile ("$(InstallDir)/Config/CPU/Cortex-M4F.svd");
   //
   // User settings
   //
   Edit.SysVar (VAR_RTT_ENABLED, 1);
-  File.Open ("$(ProjectDir)/build/manikin_mainboard_portenta/stm32h747xx/m7/zephyr/zephyr.elf");
-  
+  File.Open ("$(ProjectDir)/build/manikin_mainboard_portenta/stm32h747xx/m4/zephyr/zephyr.elf");
 }
 
 /*********************************************************************
@@ -163,9 +162,8 @@ void AfterTargetReset (void) {
 *
 **********************************************************************
 */
-void AfterTargetConnect (void) {
-Target.LoadMemory("m4_subimage/build/manikin_mainboard_portenta/stm32h747xx/m4/zephyr/zephyr.bin", 0x08100000);
-}
+//void AfterTargetConnect (void) {
+//}
 
 /*********************************************************************
 *
@@ -340,26 +338,8 @@ void AfterTargetDownload (void) {
 **********************************************************************
 */
 void _SetupTarget(void) {
-
-  unsigned int SP;
-  unsigned int PC;
-  unsigned int VectorTableAddr;
-
-  VectorTableAddr = Elf.GetBaseAddr();
   //
-  // Set up initial stack pointer
+  // this function is intentionally empty because both inital PC and
+  // initial SP were chosen not to be set
   //
-  SP = Target.ReadU32(VectorTableAddr);
-  if (SP != 0xFFFFFFFF) {
-    Target.SetReg("SP", SP);
-  }
-  //
-  // Set up entry point PC
-  //
-  PC = Elf.GetEntryPointPC();
-  if (PC != 0xFFFFFFFF) {
-    Target.SetReg("PC", PC);
-  } else {
-    Util.Error("Project script error: failed to set up entry point PC", 1);
-  }
 }

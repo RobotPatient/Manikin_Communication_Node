@@ -9,8 +9,4 @@ target_sources(app PRIVATE
   ${app_sources}
   )
 
-if(CONFIG_HAS_M4_IMAGE)
-  add_subdirectory(m4_subimage)
-endif()
-
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)
