@@ -1,0 +1,11 @@
+board:
+  name: manikin_mainboard_portenta
+  full_name: Manikin Mainboard Portenta
+  vendor: Robotpatient
+  socs:
+    - name: stm32h747xx
+  revision:
+    format: major.minor.patch
+    default: 1.0.0
+    revisions:
+      - name: 1.0.0

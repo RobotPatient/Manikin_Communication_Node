@@ -1,0 +1,17 @@
+identifier: robotpatient_manikin_portenta/stm32h747xx/m7
+name:  Robotpatient Manikin Mainboard Portenta (M4)
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+ram: 288
+flash: 1024
+supported:
+  - gpio
+testing:
+  ignore_tags:
+    - mpu
+    - nfc
+    - flash
+vendor: robotpatient

@@ -5,8 +5,8 @@
 **********************************************************************
 
 File          : /home/victor/Documents/Manikin_Communication_Node/portenta.jdebug
-Created       : 25 Apr 2025 14:50
-Ozone Version : V3.38d
+Created       : 27 Apr 2025 12:43
+Ozone Version : V3.38f
 */
 
 /*********************************************************************
@@ -22,25 +22,24 @@ void OnProjectLoad (void) {
   //
   // Dialog-generated settings
   //
-  Project.SetDevice ("STM32H747XI_M7");
-  Project.SetHostIF ("USB", "753003243");
-  Project.SetTargetIF ("SWD");
-  Project.SetTIFSpeed ("1 MHz");
-  Project.SetJLinkScript ("./ST_STM32H747_M7_TracePins.pex");
-  Project.SetTraceSource ("Trace Pins");
-  Project.SetTracePortWidth (2);
   Project.AddPathSubstitute ("/home/victor/Documents/Manikin_Communication_Node", "$(ProjectDir)");
   Project.AddPathSubstitute ("/home/victor/documents/manikin_communication_node", "$(ProjectDir)");
+  Project.SetDevice ("STM32H747XI_M7");
+  Project.SetHostIF ("USB", "");
+  Project.SetTargetIF ("SWD");
+  Project.SetTIFSpeed ("4 MHz");
   Project.AddSvdFile ("$(InstallDir)/Config/CPU/Cortex-M7F.svd");
-  Project.SetOSPlugin("ZephyrPlugin");
   //
   // User settings
   //
-  Edit.SysVar (VAR_TRACE_CORE_CLOCK, 480000000);
-  Edit.Preference (PREF_TIMESTAMP_FORMAT, TIMESTAMP_FORMAT_INST_CNT);
-  File.Open ("$(ProjectDir)/build/arduino_portenta_h7/stm32h747xx/m7/zephyr/zephyr.elf");
+Project.SetOSPlugin("ZephyrPlugin"); 
+  File.Open ("$(ProjectDir)/build/manikin_mainboard_portenta/stm32h747xx/m7/zephyr/zephyr.elf");
 }
-
+void OnTargetConnect(void)
+{
+    Target.Reset();
+    Target.Halt();
+}
 /*********************************************************************
 *
 *       OnStartupComplete
@@ -155,13 +154,8 @@ void AfterTargetReset (void) {
 *
 **********************************************************************
 */
-void BeforeTargetConnect (void) {
-  //
-  // Trace pin init is done by J-Link script file as J-Link script files are IDE independent
-  //
-  Project.SetJLinkScript("./ST_STM32H747_M7_TracePins.pex");
-}
-
+//void BeforeTargetConnect (void) {
+//}
 
 /*********************************************************************
 *
@@ -348,8 +342,25 @@ void AfterTargetDownload (void) {
 **********************************************************************
 */
 void _SetupTarget(void) {
+  unsigned int SP;
+  unsigned int PC;
+  unsigned int VectorTableAddr;
+
+  VectorTableAddr = Elf.GetBaseAddr();
   //
-  // this function is intentionally empty because both inital PC and
-  // initial SP were chosen not to be set
+  // Set up initial stack pointer
   //
+  SP = Target.ReadU32(VectorTableAddr);
+  if (SP != 0xFFFFFFFF) {
+    Target.SetReg("SP", SP);
+  }
+  //
+  // Set up entry point PC
+  //
+  PC = Elf.GetEntryPointPC();
+  if (PC != 0xFFFFFFFF) {
+    Target.SetReg("PC", PC);
+  } else {
+    Util.Error("Project script error: failed to set up entry point PC", 1);
+  }
 }

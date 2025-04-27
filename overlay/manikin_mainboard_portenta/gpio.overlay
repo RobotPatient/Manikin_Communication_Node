@@ -1,15 +1,9 @@
 / {
     aliases {
-            led0 = &myled0;
+            led0 = &red_led;
             sw0 = &mybutton0;  // Link sw0 alias to your button
     };
 
-    leds {
-            compatible = "gpio-leds";
-            myled0: led_0 {
-                    gpios = <&gpiok 5 GPIO_ACTIVE_LOW>;
-            };
-    };
     keys {
         compatible = "gpio-keys";
 
