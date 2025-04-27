@@ -20,6 +20,7 @@
 		zephyr,shell-uart = &usart1;
 		zephyr,sram = &sram1;
 		zephyr,flash = &flash1;
+		zephyr,bt-hci = &bt_hci_uart;
 	};
 };
 
@@ -29,4 +30,25 @@
 
 &usart1 {
 	status = "okay";
+};
+
+&uart7 {
+	pinctrl-0 = <&uart7_tx_pa15 &uart7_rx_pf6
+		     &uart7_cts_pf9 &uart7_rts_pf8>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	hw-flow-control;
+	status = "okay";
+
+	bt_hci_uart: bt_hci_uart {
+		compatible = "zephyr,bt-hci-uart";
+		status = "okay";
+
+		murata-1dx {
+			compatible = "infineon,cyw43xxx-bt-hci";
+			bt-reg-on-gpios = <&gpioj 12 GPIO_ACTIVE_HIGH>;
+			bt-host-wake-gpios = <&gpioj 13 GPIO_ACTIVE_HIGH>;
+			bt-dev-wake-gpios = <&gpioj 14 GPIO_ACTIVE_HIGH>;
+		};
+	};
 };

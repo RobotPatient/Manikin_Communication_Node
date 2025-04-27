@@ -48,6 +48,7 @@
 	};
 };
 
+
 &clk_hse {
 	clock-frequency = <DT_FREQ_M(25)>;
 	hse-bypass;
@@ -61,7 +62,7 @@
 
 &pll {
 	div-m = <5>;
-	mul-n = <160>;
+	mul-n = <96>;
 	div-p = <2>;
 	div-q = <10>;
 	div-r = <2>;
@@ -77,7 +78,7 @@
 
 &rcc {
 	clocks = <&pll>;
-	clock-frequency = <DT_FREQ_M(400)>;
+	clock-frequency = <DT_FREQ_M(240)>;
 };
 
 /* USART1 is enabled on M4 by default */

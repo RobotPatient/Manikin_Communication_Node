@@ -32,7 +32,8 @@ void OnProjectLoad (void) {
   //
   // User settings
   //
-Project.SetOSPlugin("ZephyrPlugin"); 
+  Edit.SysVar (VAR_RTT_ENABLED, 1);
+  Project.SetOSPlugin("ZephyrPlugin");
   File.Open ("$(ProjectDir)/build/manikin_mainboard_portenta/stm32h747xx/m7/zephyr/zephyr.elf");
 }
 void OnTargetConnect(void)

@@ -12,4 +12,13 @@
             gpios = <&gpioc 13 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
         };
     };
+
+};
+
+&sdmmc2 {
+    status = "okay";
+    bus-width = <4>;
+    pinctrl-0 = <&sdmmc2_d0_pb14 &sdmmc2_d1_pb15 &sdmmc2_d2_pb3 &sdmmc2_d3_pb4 &sdmmc2_ck_pd6 &sdmmc2_cmd_pd7>;
+    pinctrl-names = "default";
+    disk-name = "SD";
 };
