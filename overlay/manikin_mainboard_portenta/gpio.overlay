@@ -1,4 +1,8 @@
 / {
+    chosen {
+        zephyr,canbus = &fdcan1;  // use your CAN controller here
+    };
+
     aliases {
             led0 = &red_led;
             sw0 = &mybutton0;  // Link sw0 alias to your button
@@ -14,4 +18,6 @@
     };
 
 };
-
+&fdcan1 {
+    status = "okay";
+};

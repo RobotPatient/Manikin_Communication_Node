@@ -1,0 +1,16 @@
+manifest:
+  version: 0.11
+
+  projects:
+    - name: zephyr
+      path: zephyr
+      url: https://github.com/zephyrproject-rtos/zephyr
+      revision: v4.1.0
+
+    - name: ttcan_scheduler
+      path: modules/lib/ttcan_scheduler
+      url: https://github.com/Babypatient-kiem/ttcan_scheduler
+      revision: main
+
+  self:
+    path: .
