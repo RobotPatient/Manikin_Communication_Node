@@ -23,6 +23,7 @@
 #include "ttcan_scheduler.h"
 #include "ble_handlers.h"
 #include "can_wrapper.h"
+#include "message_processor.h"
 
 LOG_MODULE_REGISTER(main);
 
@@ -79,6 +80,14 @@ int main(void)
     err = led_init();
     if (err)
     {
+        return 0;
+    }
+    
+    /* Initialize the message processor */
+    err = message_processor_init();
+    if (err)
+    {
+        LOG_ERR("Message processor init failed (err %d)", err);
         return 0;
     }
 

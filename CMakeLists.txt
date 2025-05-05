@@ -6,13 +6,15 @@ project(st_ble_sensor)
 zephyr_include_directories(
     src/ble
     src/ttcan
+    src/message_processor
 )
 
 
 
 FILE(GLOB app_sources src/*.c
                       src/ble/*.c
-                      src/ttcan/*.c)
+                      src/ttcan/*.c
+                      src/message_processor/*.c)
 target_sources(app PRIVATE
   ${app_sources}
   )

@@ -15,10 +15,7 @@ static struct k_work_delayable adv_work;
 /* Button value. */
 static uint16_t but_val;
 
-/* User identification data */
-static char instructor_id[BLE_BUFFER_SIZE/2];
-static char trainee_id[BLE_BUFFER_SIZE/2];
-static uint8_t current_user_role;
+/* User identification data is now handled by the message processor module */
 
 /* Command buffer for receiving data from iOS */
 static uint8_t ios_cmd_buffer[20];
@@ -165,41 +162,17 @@ uint16_t len, uint16_t offset, uint8_t flags)
 
 	/* Check if this is a single-byte command (for backward compatibility) */
 	if (len == 1) {
-	uint8_t cmd = ble_cmd_buffer[0];
-	LOG_INF("Single-byte command: 0x%02x", cmd);
+		uint8_t cmd = ble_cmd_buffer[0];
+		LOG_INF("Single-byte command: 0x%02x", cmd);
 
-	/* Handle simple command */
-	switch (cmd) {
-		case CPR_CONTROL_LED_OFF:
-			LOG_INF("Command: LED OFF");
-			led_off();
-			break;
-
-		case CPR_CONTROL_LED_ON:
-			LOG_INF("Command: LED ON");
-			led_on();
-			break;
-
-		case CPR_CONTROL_START:
-			LOG_INF("Command: Start CPR");
-			/* Add CPR start implementation here */
-			break;
-
-		case CPR_COMMAND_STOP:
-			LOG_INF("Command: Stop CPR");
-			/* Add CPR stop implementation here */
-			break;
-
-		default:
-			LOG_WRN("Unknown single-byte command: 0x%02x", cmd);
-			break;
-		}
-
+		/* Forward to the message processor */
+		submit_direct_command(cmd);
+		
 		return len;
 	}
 
-	/* For multi-byte commands, try to process using the structured protocol */
-	process_ble_command(ble_cmd_buffer, len);
+	/* For multi-byte commands, forward to the message processor */
+	submit_command(ble_cmd_buffer, len);
 
 	return len;
 }
@@ -215,222 +188,11 @@ uint16_t len, uint16_t offset, uint8_t flags)
  * @param len:      total length of cmd_data[]
  * @return USER_ROLE_INSTRUCTOR or USER_ROLE_TRAINEE on success, 0 on failure
  */
-int detect_and_print_user_role(const uint8_t *cmd_data, size_t data_len, size_t len)
-{
-    return 0;
-	/* 1) Print raw payload in hex */
-
-    LOG_INF("CPR payload (hex):");
-    for (size_t i = 0; i < data_len && (i + 3) < len; i++) {
-        printk("0x%02x ", cmd_data[3 + i]);
-    }
-    printk("\n");
-
-    /* Check if we actually have data to process */
-    if (data_len == 0 || len <= 3) {
-        LOG_WRN("Payload too short to analyze");
-        return 0;
-    }
-
-    /* 2) Point to ASCII payload and cap its length */
-    const char *payload = (const char *)&cmd_data[3];
-    size_t payload_len = data_len;
-    if (payload_len > len - 3)
-        payload_len = len - 3;
-
-    /* 3) Check prefix */
-    int role = 0;
-    size_t prefix_len = 0;
-    size_t instr_prefix_len = strlen(USER_ROLE_INSTRUCTOR_PREFIX);
-    size_t train_prefix_len = strlen(USER_ROLE_TRAINEE_PREFIX);
-    
-    if (payload_len >= instr_prefix_len &&
-        strncmp(payload, USER_ROLE_INSTRUCTOR_PREFIX, instr_prefix_len) == 0) {
-        role = USER_ROLE_INSTRUCTOR;
-        prefix_len = instr_prefix_len;
-    }
-    else if (payload_len >= train_prefix_len &&
-             strncmp(payload, USER_ROLE_TRAINEE_PREFIX, train_prefix_len) == 0) {
-        role = USER_ROLE_TRAINEE;
-        prefix_len = train_prefix_len;
-    }
-    else {
-        LOG_WRN("Unknown role prefix in payload");
-        return 0;
-    }
-
-    /* Ensure we have an ID component */
-    if (payload_len <= prefix_len) {
-        LOG_WRN("Role prefix found but no ID present");
-        return role;
-    }
-
-    /* 4) Extract ID string */
-    size_t id_len = payload_len - prefix_len;
-    if (id_len > 15) id_len = 15;  // avoid large strings in logging
-
-    char user_id[16];  // Smaller buffer
-    if (id_len > 0) {
-        memcpy(user_id, payload + prefix_len, id_len);
-        user_id[id_len] = '\0';
-    } else {
-        user_id[0] = '\0';
-    }
-
-    /* 5) Log result */
-    if (role == USER_ROLE_INSTRUCTOR) {
-        LOG_INF("Detected role: INSTRUCTOR, ID=\"%s\"", user_id);
-    } else {
-        LOG_INF("Detected role: TRAINEE, ID=\"%s\"", user_id);
-    }
-
-    /* 6) Store the ID in the appropriate buffer */
-    if (role == USER_ROLE_INSTRUCTOR) {
-        memset(instructor_id, 0, sizeof(instructor_id));
-        strncpy(instructor_id, user_id, sizeof(instructor_id) - 1);
-        instructor_id[sizeof(instructor_id) - 1] = '\0';
-        current_user_role = USER_ROLE_INSTRUCTOR;
-    } else {
-        memset(trainee_id, 0, sizeof(trainee_id));
-        strncpy(trainee_id, user_id, sizeof(trainee_id) - 1);
-        trainee_id[sizeof(trainee_id) - 1] = '\0';
-        current_user_role = USER_ROLE_TRAINEE;
-    }
-
-    return role;
-}
-
-/* Process commands received via BLE */
+/* Process commands received via BLE - this now delegates to the message processor */
 void process_ble_command(uint8_t *cmd_data, uint16_t len)
 {
-	/* If not an ID message, proceed with structured protocol processing */
-	/* Validate protocol structure:
-	 * [START][LENGTH][COLON][DATA...][SEMICOLON][END]
-	 * Minimum size: 5 bytes (START, LENGTH, COLON, SEMICOLON, END with no data)
-	 */
-	if (len < 5) {
-		LOG_WRN("Command too short, %d bytes", len);
-		return;
-	}
-
-	/* Check start byte */
-	if (cmd_data[0] != BLE_COMMAND_BYTE_START) {
-		LOG_WRN("Invalid start byte: 0x%02x, expected 0x%02x",
-				cmd_data[0], BLE_COMMAND_BYTE_START);
-		return;
-	}
-
-	/* Safely retrieve and validate the data length */
-	uint8_t data_len = 0;
-	if (len > 1) {
-		data_len = cmd_data[1];
-	} else {
-		LOG_WRN("Buffer too short to read data length");
-		return;
-	}
-	
-	/* Basic sanity check for data length */
-	if (data_len > BLE_BUFFER_SIZE) {
-		LOG_WRN("Data length value too large: %d", data_len);
-		return;
-	}
-	
-	/* Calculate total expected length based on protocol format */
-	uint16_t expected_total_len = 5 + data_len; // START + LEN + COLON + data + SEMICOLON + END
-	
-	/* Ensure the buffer contains enough bytes for the claimed data length */
-	if (expected_total_len > len) {
-		LOG_WRN("Data length mismatch: expected total %d bytes, got %d",
-				expected_total_len, len);
-		return;
-	}
-
-	/* Check colon byte */
-	if (len > 2 && cmd_data[2] != BLE_COMMAND_MSG_COLON) {
-		LOG_WRN("Invalid colon byte: 0x%02x, expected 0x%02x",
-				cmd_data[2], BLE_COMMAND_MSG_COLON);
-		return;
-	}
-
-	/* Check end structure - with bounds checking */
-	uint16_t semicolon_pos = 3 + data_len;
-	if (semicolon_pos < len && cmd_data[semicolon_pos] != BLE_COMMAND_MSG_SEMICOLON) {
-		LOG_WRN("Invalid semicolon byte at position %d: 0x%02x", 
-			   semicolon_pos, cmd_data[semicolon_pos]);
-		return;
-	}
-
-	uint16_t end_pos = 4 + data_len;
-	if (end_pos < len && cmd_data[end_pos] != BLE_COMMAND_MSG_END) {
-		LOG_WRN("Invalid end byte at position %d: 0x%02x", 
-			   end_pos, cmd_data[end_pos]);
-		return;
-	}
-
-	/* Message is valid, process the data */
-	LOG_INF("Valid message received, data length: %d", data_len);
-
-	/* Process the command - data starts at index 3 */
-	if (data_len > 0) {
-		/* Extra safety check to ensure data is within bounds */
-		if (3 + data_len <= len) {
-			uint8_t command = cmd_data[3]; /* First byte of data */
-			
-			LOG_INF("Processing command byte: 0x%02x", command);
-
-			/* Extremely simplified handling to avoid stack usage */
-			if (command == CPR_CONTROL_LED_OFF) {
-				LOG_INF("Command: LED OFF");
-				/* Request LED off via flags instead of direct call */
-				led_requested_state = false;
-				led_request_pending = true;
-			}
-			else if (command == CPR_CONTROL_LED_ON) {
-				LOG_INF("Command: LED ON");
-				/* Request LED on via flags instead of direct call */
-				led_requested_state = true;
-				led_request_pending = true;
-			}
-			else if (command == CPR_CONTROL_START) {
-				LOG_INF("Command: Start CPR");
-				/* Request LED on via flags instead of direct call */
-				led_requested_state = true;
-				led_request_pending = true;
-			}
-			else if (command == CPR_COMMAND_STOP) {
-				LOG_INF("Command: Stop CPR");
-				/* Request LED off via flags instead of direct call */
-				led_requested_state = false;
-				led_request_pending = true;
-			}
-			else if (command == CPR_COMMAND_DATA) {
-				LOG_INF("Command: Received CPR Init Data");
-				/* Special handling for CPR data - just turn on LED for now */
-				//led_on();
-				
-				/* If data starts with in: or tr: - set the role but don't try to extract the whole ID */
-
-				
-				if (data_len >= 4 && cmd_data[4] == 'i' && cmd_data[5] == 'n' && cmd_data[6] == ':') {
-					current_user_role = USER_ROLE_INSTRUCTOR;
-					LOG_INF("Detected instructor role");
-				}
-				else if (data_len >= 4 && cmd_data[4] == 't' && cmd_data[5] == 'r' && cmd_data[6] == ':') {
-					current_user_role = USER_ROLE_TRAINEE;
-					LOG_INF("Detected trainee role");
-				}
-			
-			}
-			else {
-				LOG_WRN("Unknown command: 0x%02x", command);
-			}
-		} else {
-			LOG_ERR("Data length exceeds buffer bounds: data_len=%d, buffer_len=%d", 
-				data_len, len);
-		}
-	} else {
-		LOG_WRN("Valid message structure but no data");
-	}
+    /* Pass through to the message processor using the submit API */
+    submit_command(cmd_data, len);
 }
 
 /* Handler for iOS app commands */
@@ -462,60 +224,14 @@ static ssize_t ios_cmd_recv(struct bt_conn *conn,
 /* Process commands received from the iOS app */
 void process_ios_command(uint8_t *cmd_data, uint16_t len)
 {
-    /* Check if this is a text-based ID message */
-    if (len >= 3) {
-        /* Check for instructor ID prefix (without using large buffer) */
-        size_t instr_prefix_len = strlen(USER_ROLE_INSTRUCTOR_PREFIX);
-        if (len > instr_prefix_len && 
-            memcmp(cmd_data, USER_ROLE_INSTRUCTOR_PREFIX, instr_prefix_len) == 0) {
-            
-            /* Calculate available ID length (with bounds check) */
-            size_t max_id_len = sizeof(instructor_id) - 1;
-            size_t avail_data = len - instr_prefix_len;
-            size_t id_len = (avail_data < max_id_len) ? avail_data : max_id_len;
-            
-            if (id_len > 0) {
-                /* Safely copy ID without large buffer */
-                memset(instructor_id, 0, sizeof(instructor_id));
-                memcpy(instructor_id, cmd_data + instr_prefix_len, id_len);
-                instructor_id[id_len] = '\0';  /* Ensure null-termination */
-                current_user_role = USER_ROLE_INSTRUCTOR;
-                
-                LOG_INF("Set instructor ID: %s", instructor_id);
-                /* Request LED on via flags instead of direct call */
-                led_requested_state = true;
-                led_request_pending = true;
-                return;
-            }
-        }
-        
-        /* Check for trainee ID prefix (without using large buffer) */
-        size_t train_prefix_len = strlen(USER_ROLE_TRAINEE_PREFIX);
-        if (len > train_prefix_len && 
-            memcmp(cmd_data, USER_ROLE_TRAINEE_PREFIX, train_prefix_len) == 0) {
-            
-            /* Calculate available ID length (with bounds check) */
-            size_t max_id_len = sizeof(trainee_id) - 1;
-            size_t avail_data = len - train_prefix_len;
-            size_t id_len = (avail_data < max_id_len) ? avail_data : max_id_len;
-            
-            if (id_len > 0) {
-                /* Safely copy ID without large buffer */
-                memset(trainee_id, 0, sizeof(trainee_id));
-                memcpy(trainee_id, cmd_data + train_prefix_len, id_len);
-                trainee_id[id_len] = '\0';  /* Ensure null-termination */
-                current_user_role = USER_ROLE_TRAINEE;
-                
-                LOG_INF("Set trainee ID: %s", trainee_id);
-                /* Request LED on via flags instead of direct call */
-                led_requested_state = true;
-                led_request_pending = true;
-                return;
-            }
-        }
+    /* First try to process using message processor for standard commands */
+    int ret = submit_command(cmd_data, len);
+    if (ret == 0) {
+        /* Command was successfully processed by message processor */
+        return;
     }
-
-    /* Simple command processor - adjust based on your protocol */
+    
+    /* If message processor didn't handle it, try the BLE-specific commands */
     if (len < 1) {
         LOG_WRN("Command too short");
         return;
@@ -799,25 +515,7 @@ void disconnected(struct bt_conn *disconn, uint8_t reason)
     }
 }
 
-/* Get currently set user IDs */
-void get_user_ids(char *instr_buf, size_t instr_size, char *train_buf, size_t train_size)
-{
-    if (instr_buf && instr_size > 0) {
-        strncpy(instr_buf, instructor_id, instr_size - 1);
-        instr_buf[instr_size - 1] = '\0';
-    }
-    
-    if (train_buf && train_size > 0) {
-        strncpy(train_buf, trainee_id, train_size - 1);
-        train_buf[train_size - 1] = '\0';
-    }
-}
-
-/* Get current user role */
-uint8_t get_current_user_role(void)
-{
-    return current_user_role;
-}
+/* The user ID and role functions are now provided by the message_processor module */
 
 /* Work handler function to restart advertising */
 void restart_advertising(struct k_work *work)

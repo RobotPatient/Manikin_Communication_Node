@@ -24,24 +24,20 @@
 /* BLE command buffer size */
 #define BLE_BUFFER_SIZE 40
 
-/* BLE command types */
+/* Include our message processor for command definitions */
+#include "message_processor.h"
 
-#define BLE_COMMAND_BYTE_START       0x01
-#define BLE_COMMAND_MSG_COLON        0x3A
-#define BLE_COMMAND_MSG_SEMICOLON    0x3B
-#define BLE_COMMAND_MSG_END          0x17
+/* Backwards compatibility for existing code */
+#define BLE_COMMAND_BYTE_START       MSG_COMMAND_BYTE_START
+#define BLE_COMMAND_MSG_COLON        MSG_COMMAND_MSG_COLON
+#define BLE_COMMAND_MSG_SEMICOLON    MSG_COMMAND_MSG_SEMICOLON
+#define BLE_COMMAND_MSG_END          MSG_COMMAND_MSG_END
 
-#define CPR_CONTROL_LED_OFF          0x00
-#define CPR_CONTROL_LED_ON           0x01
-#define CPR_CONTROL_START            0x02
-#define CPR_COMMAND_STOP             0x03
-#define CPR_COMMAND_DATA             0x04
-
-/* User role identifiers */
-#define USER_ROLE_INSTRUCTOR_PREFIX  "in:"
-#define USER_ROLE_TRAINEE_PREFIX     "tr:"
-#define USER_ROLE_INSTRUCTOR         1
-#define USER_ROLE_TRAINEE            2
+#define CPR_CONTROL_LED_OFF          CMD_CONTROL_LED_OFF
+#define CPR_CONTROL_LED_ON           CMD_CONTROL_LED_ON
+#define CPR_CONTROL_START            CMD_CONTROL_START
+#define CPR_COMMAND_STOP             CMD_COMMAND_STOP
+#define CPR_COMMAND_DATA             CMD_COMMAND_DATA
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,8 +58,7 @@ void send_can_message(uint32_t can_id, uint8_t *data, uint8_t len);
 void process_ios_command(uint8_t *cmd_data, uint16_t len);
 void restart_advertising(struct k_work *work);
 void process_ble_command(uint8_t *cmd_data, uint16_t len);
-void get_user_ids(char *instr_buf, size_t instr_size, char *train_buf, size_t train_size);
-uint8_t get_current_user_role(void);
+/* These functions are now provided by the message processor module */
 // int detect_and_print_user_role(const uint8_t *cmd_data, size_t data_len, size_t len);
 
 
