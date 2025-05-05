@@ -26,8 +26,8 @@ static bool has_time_data = false;
 /* Message queue for asynchronous processing */
 K_MSGQ_DEFINE(command_msgq, MSG_BUFFER_SIZE, MSG_QUEUE_SIZE, 4);
 
-/* Command processing thread stack */
-K_THREAD_STACK_DEFINE(processor_stack, 1024);
+/* Command processing thread stack - increased to handle larger messages */
+K_THREAD_STACK_DEFINE(processor_stack, 2560);
 static struct k_thread processor_thread;
 static k_tid_t processor_tid;
 
@@ -52,9 +52,13 @@ static void processor_thread_func(void *arg1, void *arg2, void *arg3)
             uint8_t cmd_type = cmd_buffer[0];
             uint16_t cmd_len = 0;
             
+            /* Minimal logging to reduce stack usage */
+            LOG_INF("Processing command type: %d", cmd_type);
+            
             if (cmd_type == 0) {
                 /* Single byte direct command */
                 uint8_t cmd_byte = cmd_buffer[1];
+                
                 ret = process_direct_command(cmd_byte);
                 if (ret) {
                     LOG_WRN("Error processing direct command: %d", ret);
@@ -62,6 +66,11 @@ static void processor_thread_func(void *arg1, void *arg2, void *arg3)
             } else {
                 /* Full command buffer */
                 cmd_len = (cmd_buffer[1] << 8) | cmd_buffer[2];
+
+                if (cmd_len > 3) {
+                    LOG_INF("Command: %d", cmd_buffer[3]);
+                }
+                
                 ret = process_command(&cmd_buffer[3], cmd_len);
                 if (ret) {
                     LOG_WRN("Error processing command: %d", ret);
@@ -78,13 +87,13 @@ int message_processor_init(void)
     memset(trainee_id, 0, sizeof(trainee_id));
     current_user_role = USER_ROLE_NONE;
     
-    /* Start the processor thread */
+    /* Start the processor thread with a slightly lower priority to ensure BT threads have precedence */
     processor_tid = k_thread_create(&processor_thread,
                                     processor_stack,
                                     K_THREAD_STACK_SIZEOF(processor_stack),
                                     processor_thread_func,
                                     NULL, NULL, NULL,
-                                    5, 0, K_NO_WAIT);
+                                    7, 0, K_NO_WAIT);
     
     if (processor_tid == NULL) {
         LOG_ERR("Failed to create message processor thread");
@@ -151,59 +160,36 @@ static void process_id_string(const uint8_t *data, size_t len, bool is_instructo
 
 /**
  * Private helper for processing time data
+ * 
+ * Optimized version with minimal stack usage and reduced logging
  */
 static void process_time_data(const uint8_t *data_payload, size_t data_len)
 {
     /* Expected format: YYYYMMDDHHMMSSMS (14 or 16 characters) */
     const size_t expected_time_len_min = 14;  /* At minimum, we need YYYYMMDDHHMMSS */
     
-    /* Print raw time data for debugging */
-    LOG_INF("Time Data received, %d bytes", data_len);
-    
-    /* Print hex bytes for debugging */
-    LOG_INF("Time Data bytes:");
-    for (int i = 0; i < data_len; i++) {
-        printk("%02x ", data_payload[i]);
-    }
-    printk("\n");
-    
-    /* Also print as ASCII */
-    LOG_INF("Time Data as ASCII: ");
-    for (int i = 0; i < data_len && i < sizeof(time_data) - 1; i++) {
-        printk("%c", data_payload[i]);
-    }
-    printk("\n");
-    
-    /* Validate data length */
+    /* Validate data length with minimal logging */
     if (data_len < expected_time_len_min) {
-        LOG_WRN("Time data too short: %d bytes, expected at least %d", 
-                data_len, expected_time_len_min);
+        LOG_WRN("Time data too short: %d bytes", data_len);
         return;
     }
     
-    /* Copy time data safely (with null-termination) */
-    memset(time_data, 0, sizeof(time_data));
+    /* Copy time data safely with bounds checking */
     size_t copy_len = data_len < sizeof(time_data) - 1 ? data_len : sizeof(time_data) - 1;
     memcpy(time_data, data_payload, copy_len);
     time_data[copy_len] = '\0';
     
+    /* Mark as valid */
     has_time_data = true;
     
-    /* Parse the time components, adjusting output based on data length */
-    LOG_INF("Received timestamp: %s", time_data);
+    /* Single minimal log message */
+    LOG_INF("Time data set: %.4s-%.2s-%.2s %.2s:%.2s:%.2s", 
+            time_data, time_data + 4, time_data + 6,
+            time_data + 8, time_data + 10, time_data + 12);
     
-    if (copy_len >= 14) {
-        LOG_INF("Year: %.4s, Month: %.2s, Day: %.2s", 
-                time_data, time_data + 4, time_data + 6);
-        LOG_INF("Hour: %.2s, Minute: %.2s, Second: %.2s", 
-                time_data + 8, time_data + 10, time_data + 12);
-                
-        /* If milliseconds are included */
-        if (copy_len >= 16) {
-            LOG_INF("Millisecond: %.2s", time_data + 14);
-        }
-    }
-            
+    /* Parse time into system time if needed */
+    /* TODO: Future enhancement - convert to system time and sync RTC */
+    
     /* Request LED on to provide visual feedback that time was received */
     request_led_state(true);
 }
@@ -272,6 +258,22 @@ static int process_direct_command(uint8_t cmd_byte)
 
 static int process_command(uint8_t *cmd_data, uint16_t len)
 {
+    LOG_INF("Processing command data with length: %d", len);
+    LOG_INF("Start byte: 0x%02x", cmd_data[0]);
+    
+    /* Simplified logging for safety */
+    LOG_INF("First bytes: %02x %02x %02x %02x", 
+           (len > 0) ? cmd_data[0] : 0,
+           (len > 1) ? cmd_data[1] : 0,
+           (len > 2) ? cmd_data[2] : 0,
+           (len > 3) ? cmd_data[3] : 0);
+           
+    /* Check specifically for timedata command with safer bounds checking */
+    if (len > 4 && cmd_data[0] == MSG_COMMAND_BYTE_START && 
+        cmd_data[2] == MSG_COMMAND_MSG_COLON && cmd_data[3] == CMD_COMMAND_TIMEDATA) {
+        LOG_INF("Time data command found");
+    }
+    
     /* Check for direct text ID formats (no protocol framing) */
     size_t instr_prefix_len = strlen(USER_ROLE_INSTRUCTOR_PREFIX);
     if (len >= instr_prefix_len &&
@@ -388,8 +390,13 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
             else if (command == CMD_COMMAND_TIMEDATA) {
                 LOG_INF("Command: Received Time Data");
                 
-                /* Process the time data payload (command byte is already at index 3) */
-                process_time_data(&cmd_data[4], data_len - 1);
+                /* Safety check for data length */
+                if (data_len > 1) {
+                    /* Process the time data payload (command byte is already at index 3) */
+                    process_time_data(&cmd_data[4], data_len - 1);
+                } else {
+                    LOG_WRN("Time data command with no payload");
+                }
             }
             else {
                 LOG_WRN("Unknown command: 0x%02x", command);
@@ -497,28 +504,27 @@ bool has_received_time_data(void)
  * @param len Length of data in the buffer
  * @return 0 on success, negative error code on failure
  */
+/* Pre-allocated static buffer for queue submissions to avoid stack allocation */
+static uint8_t static_submit_buffer[MSG_BUFFER_SIZE];
+
 int submit_command(const uint8_t *cmd_data, uint16_t len)
 {
     if (!cmd_data || len == 0 || len > MSG_BUFFER_SIZE - 3) {
-        LOG_WRN("Invalid command data or length: %d", len);
-        return -EINVAL;
+        return -EINVAL;  /* No logging to save stack */
     }
     
-    uint8_t buffer[MSG_BUFFER_SIZE];
+    /* No logging to minimize stack usage */
     
     /* Format: [TYPE(1)][LEN_MSB(1)][LEN_LSB(1)][DATA(len)] */
-    buffer[0] = 1;  /* Type = command buffer */
-    buffer[1] = (len >> 8) & 0xFF;  /* Length MSB */
-    buffer[2] = len & 0xFF;        /* Length LSB */
+    static_submit_buffer[0] = 1;  /* Type = command buffer */
+    static_submit_buffer[1] = (len >> 8) & 0xFF;  /* Length MSB */
+    static_submit_buffer[2] = len & 0xFF;        /* Length LSB */
     
     /* Copy command data */
-    memcpy(&buffer[3], cmd_data, len);
+    memcpy(&static_submit_buffer[3], cmd_data, len);
     
     /* Submit to message queue */
-    int ret = k_msgq_put(&command_msgq, buffer, K_NO_WAIT);
-    if (ret) {
-        LOG_WRN("Failed to queue command: %d", ret);
-    }
+    int ret = k_msgq_put(&command_msgq, static_submit_buffer, K_NO_WAIT);
     
     return ret;
 }
@@ -532,19 +538,15 @@ int submit_command(const uint8_t *cmd_data, uint16_t len)
  * @param cmd_byte The command byte to process
  * @return 0 on success, negative error code on failure
  */
+/* Pre-allocated static buffer for direct commands */
+static uint8_t static_direct_buffer[MSG_BUFFER_SIZE];
+
 int submit_direct_command(uint8_t cmd_byte)
 {
-    uint8_t buffer[MSG_BUFFER_SIZE];
-    
     /* Format: [TYPE(1)][CMD_BYTE(1)][UNUSED...] */
-    buffer[0] = 0;  /* Type = direct command */
-    buffer[1] = cmd_byte;
+    static_direct_buffer[0] = 0;  /* Type = direct command */
+    static_direct_buffer[1] = cmd_byte;
     
-    /* Submit to message queue */
-    int ret = k_msgq_put(&command_msgq, buffer, K_NO_WAIT);
-    if (ret) {
-        LOG_WRN("Failed to queue direct command 0x%02x: %d", cmd_byte, ret);
-    }
-    
-    return ret;
+    /* Submit to message queue - no error logging to save stack */
+    return k_msgq_put(&command_msgq, static_direct_buffer, K_NO_WAIT);
 }

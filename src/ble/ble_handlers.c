@@ -156,16 +156,13 @@ uint16_t len, uint16_t offset, uint8_t flags)
 	/* Copy the data to our buffer */
 	memcpy(ble_cmd_buffer + offset, buf, len);
 
-	LOG_INF("Received data, %d bytes", len);
+	/* No logging here to minimize stack usage */
 
 	/* Check if this is a single-byte command (for backward compatibility) */
 	if (len == 1) {
 		uint8_t cmd = ble_cmd_buffer[0];
-		LOG_INF("Single-byte command: 0x%02x", cmd);
-
-		/* Forward to the message processor */
+		/* Forward to the message processor - no logging */
 		submit_direct_command(cmd);
-		
 		return len;
 	}
 
