@@ -36,6 +36,12 @@
 #define CPR_CONTROL_START            0x02
 #define CPR_COMMAND_STOP             0x03
 
+/* User role identifiers */
+#define USER_ROLE_INSTRUCTOR_PREFIX  "in:"
+#define USER_ROLE_TRAINEE_PREFIX     "tr:"
+#define USER_ROLE_INSTRUCTOR         1
+#define USER_ROLE_TRAINEE            2
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,6 +57,8 @@ void send_can_message(uint32_t can_id, uint8_t *data, uint8_t len);
 void process_ios_command(uint8_t *cmd_data, uint16_t len);
 void restart_advertising(struct k_work *work);
 void process_ble_command(uint8_t *cmd_data, uint16_t len);
+void get_user_ids(char *instr_buf, size_t instr_size, char *train_buf, size_t train_size);
+uint8_t get_current_user_role(void);
 
 #ifdef __cplusplus
 }

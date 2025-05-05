@@ -11,6 +11,11 @@ static struct k_work_delayable adv_work;
 /* Button value. */
 static uint16_t but_val;
 
+/* User identification data */
+static char instructor_id[BLE_BUFFER_SIZE/2];
+static char trainee_id[BLE_BUFFER_SIZE/2];
+static uint8_t current_user_role;
+
 /* Command buffer for receiving data from iOS */
 static uint8_t ios_cmd_buffer[20];
 
@@ -198,6 +203,52 @@ uint16_t len, uint16_t offset, uint8_t flags)
 /* Process commands received via BLE */
 void process_ble_command(uint8_t *cmd_data, uint16_t len)
 {
+	/* Check if this is a text-based ID message */
+	if (len >= 3) {
+		/* Create a temporary buffer for string operations */
+		char text_buffer[BLE_BUFFER_SIZE];
+		memset(text_buffer, 0, sizeof(text_buffer));
+		
+		/* Copy data to the text buffer for string functions */
+		if (len <= BLE_BUFFER_SIZE - 1) {
+			memcpy(text_buffer, cmd_data, len);
+			text_buffer[len] = '\0'; /* Ensure null-termination */
+			
+			/* Check for instructor or trainee ID */
+			if (strncmp(text_buffer, USER_ROLE_INSTRUCTOR_PREFIX, strlen(USER_ROLE_INSTRUCTOR_PREFIX)) == 0) {
+				/* This is an instructor ID message */
+				const char *id_start = text_buffer + strlen(USER_ROLE_INSTRUCTOR_PREFIX);
+				size_t id_len = strlen(id_start);
+				
+				if (id_len > 0 && id_len < sizeof(instructor_id)) {
+					memset(instructor_id, 0, sizeof(instructor_id));
+					strncpy(instructor_id, id_start, id_len);
+					current_user_role = USER_ROLE_INSTRUCTOR;
+					
+					LOG_INF("Set instructor ID: %s", instructor_id);
+					led_on();  /* Provide visual feedback */
+					return;
+				}
+			}
+			else if (strncmp(text_buffer, USER_ROLE_TRAINEE_PREFIX, strlen(USER_ROLE_TRAINEE_PREFIX)) == 0) {
+				/* This is a trainee ID message */
+				const char *id_start = text_buffer + strlen(USER_ROLE_TRAINEE_PREFIX);
+				size_t id_len = strlen(id_start);
+				
+				if (id_len > 0 && id_len < sizeof(trainee_id)) {
+					memset(trainee_id, 0, sizeof(trainee_id));
+					strncpy(trainee_id, id_start, id_len);
+					current_user_role = USER_ROLE_TRAINEE;
+					
+					LOG_INF("Set trainee ID: %s", trainee_id);
+					led_on();  /* Provide visual feedback */
+					return;
+				}
+			}
+		}
+	}
+
+	/* If not an ID message, proceed with structured protocol processing */
 	/* Validate protocol structure:
 	 * [START][LENGTH][COLON][DATA...][SEMICOLON][END]
 	 * Minimum size: 5 bytes (START, LENGTH, COLON, SEMICOLON, END with no data)
@@ -312,6 +363,51 @@ static ssize_t ios_cmd_recv(struct bt_conn *conn,
 /* Process commands received from the iOS app */
 void process_ios_command(uint8_t *cmd_data, uint16_t len)
 {
+    /* Check if this is a text-based ID message */
+    if (len >= 3) {
+        /* Create a temporary buffer for string operations */
+        char text_buffer[BLE_BUFFER_SIZE];
+        memset(text_buffer, 0, sizeof(text_buffer));
+        
+        /* Copy data to the text buffer for string functions */
+        if (len <= BLE_BUFFER_SIZE - 1) {
+            memcpy(text_buffer, cmd_data, len);
+            text_buffer[len] = '\0'; /* Ensure null-termination */
+            
+            /* Check for instructor or trainee ID */
+            if (strncmp(text_buffer, USER_ROLE_INSTRUCTOR_PREFIX, strlen(USER_ROLE_INSTRUCTOR_PREFIX)) == 0) {
+                /* This is an instructor ID message */
+                const char *id_start = text_buffer + strlen(USER_ROLE_INSTRUCTOR_PREFIX);
+                size_t id_len = strlen(id_start);
+                
+                if (id_len > 0 && id_len < sizeof(instructor_id)) {
+                    memset(instructor_id, 0, sizeof(instructor_id));
+                    strncpy(instructor_id, id_start, id_len);
+                    current_user_role = USER_ROLE_INSTRUCTOR;
+                    
+                    LOG_INF("Set instructor ID: %s", instructor_id);
+                    led_on();  /* Provide visual feedback */
+                    return;
+                }
+            }
+            else if (strncmp(text_buffer, USER_ROLE_TRAINEE_PREFIX, strlen(USER_ROLE_TRAINEE_PREFIX)) == 0) {
+                /* This is a trainee ID message */
+                const char *id_start = text_buffer + strlen(USER_ROLE_TRAINEE_PREFIX);
+                size_t id_len = strlen(id_start);
+                
+                if (id_len > 0 && id_len < sizeof(trainee_id)) {
+                    memset(trainee_id, 0, sizeof(trainee_id));
+                    strncpy(trainee_id, id_start, id_len);
+                    current_user_role = USER_ROLE_TRAINEE;
+                    
+                    LOG_INF("Set trainee ID: %s", trainee_id);
+                    led_on();  /* Provide visual feedback */
+                    return;
+                }
+            }
+        }
+    }
+
     /* Simple command processor - adjust based on your protocol */
     if (len < 1) {
         LOG_WRN("Command too short");
@@ -594,6 +690,26 @@ void disconnected(struct bt_conn *disconn, uint8_t reason)
         /* Schedule advertising restart with a short delay to allow resource cleanup */
         k_work_schedule(&adv_work, K_MSEC(500));
     }
+}
+
+/* Get currently set user IDs */
+void get_user_ids(char *instr_buf, size_t instr_size, char *train_buf, size_t train_size)
+{
+    if (instr_buf && instr_size > 0) {
+        strncpy(instr_buf, instructor_id, instr_size - 1);
+        instr_buf[instr_size - 1] = '\0';
+    }
+    
+    if (train_buf && train_size > 0) {
+        strncpy(train_buf, trainee_id, train_size - 1);
+        train_buf[train_size - 1] = '\0';
+    }
+}
+
+/* Get current user role */
+uint8_t get_current_user_role(void)
+{
+    return current_user_role;
 }
 
 /* Work handler function to restart advertising */
