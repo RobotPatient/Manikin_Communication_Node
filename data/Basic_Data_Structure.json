@@ -1,0 +1,44 @@
+{
+  "version": "v1.0.0",
+  "session": {
+    "session_id": "#",
+    "date": "#",
+    "start_time": 1746377400,
+    "instructor_id": "INS123",
+    "trainee_id": "TRA456"
+  },
+  "manikin": {
+    "manikin_id": "<uuid_of_the_manikin>",
+    "sensors": {
+      "COMP001": "compression",
+      "VENT002": "ventilation",
+      "FINGER003": "thorax_finger_pressure",
+      "HEADPRES004": "absolute_pressure",
+      "HEADIMU005": "imu_6dof",
+      "THORAXIMU006": "imu_9dof"
+    }
+  },
+  "compression_data": [
+    { "timestamp_relative": 100, "sensor_id": "COMP001", "depth": 52.1 },
+    { "timestamp_relative": 950, "sensor_id": "COMP001", "depth": 53.5 }
+  ],
+  "ventilation_data": [
+    { "timestamp_relative": 3000, "sensor_id": "VENT002", "volume": 0.86 }
+  ],
+  "thorax_finger_pressure_data": [
+    { "timestamp_relative": 25, "sensor_id": "FINGER003", "pressure": [ 98, 245, 505, 755, 895, 585, 295, 145 ] },
+    { "timestamp_relative": 1025, "sensor_id": "FINGER003", "pressure": [ 102, 255, 515, 765, 905, 605, 305, 155 ] }
+  ],
+  "head_pressure_data": [
+    { "timestamp_relative": 150, "sensor_id": "HEADPRES004", "pressure": 101315 },
+    { "timestamp_relative": 3450, "sensor_id": "HEADPRES004", "pressure": 101495 }
+  ],
+  "head_imu_data": [
+    { "timestamp_relative": 50, "sensor_id": "HEADIMU005", "accel": [ 0.13, -0.19, 9.76 ], "gyro": [ 0.03, -0.01, 0.02 ] },
+    { "timestamp_relative": 1050, "sensor_id": "HEADIMU005", "accel": [ 0.10, -0.20, 9.79 ], "gyro": [ 0.05, 0.0, 0.04 ] }
+  ],
+  "thorax_imu_data": [
+    { "timestamp_relative": 75, "sensor_id": "THORAXIMU006", "accel": [ 0.02, 0.01, 9.81 ], "gyro": [ 0.01, 0.0, -0.02 ], "mag": [ 20.4, 5.3, -30.3 ] },
+    { "timestamp_relative": 1075, "sensor_id": "THORAXIMU006", "accel": [ -0.01, 0.03, 9.83 ], "gyro": [ -0.02, 0.01, 0.0 ] , "mag": [ 20.7, 5.1, -30.0 ] }
+  ]
+}

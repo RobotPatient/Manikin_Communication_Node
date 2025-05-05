@@ -1,0 +1,36 @@
+{
+  "guideline_name": "AHA 2020 Infant CPR",
+  "version": "v1.0.0",
+  "compression": {
+    "target_depth_min_mm": 4,   // Approximately 1.5 inches (adjust based on guidelines)
+    "target_depth_max_mm": 4,   // Often specified as a fraction of chest depth
+    "target_rate_min_bpm": 100,
+    "target_rate_max_bpm": 120,
+    "recoil_threshold_percent": 90,
+    "low_depth_threshold_mm": 3.5,
+    "high_depth_threshold_mm": 4.5,
+    "low_rate_threshold_bpm": 90,
+    "high_rate_threshold_bpm": 130,
+    "hand_placement": "Two fingers on the center of the infant's chest, just below the nipple line"
+  },
+  "ventilation": {
+    "target_volume_ml": 20-30, // Approximate tidal volume in mL
+    "target_duration_sec": 1,
+    "low_volume_threshold_ml": 15,
+    "high_volume_threshold_ml": 35,
+    "low_duration_threshold_sec": 0.8,
+    "high_duration_threshold_sec": 1.2,
+    "delivery_method": "Mouth-to-mouth and nose or bag-valve-mask"
+  },
+  "hand_position": {
+    "acceptable_pressure_deviation_percent": 25 // May need adjustment for smaller chest
+  },
+  "head_position": {
+    "neutral_or_slight_extension_degrees_min": -5, // Degrees of flexion/extension
+    "neutral_or_slight_extension_degrees_max": 10
+  },
+  "feedback_settings": {
+    "rate_calculation_window_ms": 2000,
+    "depth_averaging_window_ms": 500
+  }
+}

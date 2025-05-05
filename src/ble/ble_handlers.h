@@ -31,7 +31,7 @@ void button_callback(const struct device *gpiob, struct gpio_callback *cb, uint3
 void can_buffer_add(const void *frame);
 void send_can_message(uint32_t can_id, uint8_t *data, uint8_t len);
 void process_ios_command(uint8_t *cmd_data, uint16_t len);
-static void restart_advertising(struct k_work *work);
+void restart_advertising(struct k_work *work);
 
 #ifdef __cplusplus
 }

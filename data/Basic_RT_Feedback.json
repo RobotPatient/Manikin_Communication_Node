@@ -1,0 +1,17 @@
+{
+  "ts_rel": <unsigned integer>,
+  "comp": {
+    "depth": <float>,
+    "rate": <float>,
+    "recoil": <boolean>,
+    "depth_ok": <boolean>,
+    "rate_ok": <boolean>
+  },
+  "vent": {
+    "volume": <float>,
+    "duration": <float>,
+    "volume_ok": <boolean>
+  },
+  "hands_ok": <boolean>,
+  "head_ok": <boolean>
+}

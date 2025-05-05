@@ -456,7 +456,7 @@ void disconnected(struct bt_conn *disconn, uint8_t reason)
 }
 
 /* Work handler function to restart advertising */
-static void restart_advertising(struct k_work *work)
+void restart_advertising(struct k_work *work)
 {
     int err;
     

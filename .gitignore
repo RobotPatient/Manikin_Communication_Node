@@ -47,3 +47,6 @@ cmake-*
 
 # Ozone debug files
 *.user
+
+# ZIP files
+*.zip
