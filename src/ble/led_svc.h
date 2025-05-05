@@ -16,6 +16,8 @@ extern "C" {
 #endif
 
 void led_update(void);
+void led_on(void);
+void led_off(void);
 int led_init(void);
 
 #ifdef __cplusplus

@@ -3,6 +3,8 @@
 
 LOG_MODULE_REGISTER(ble_handlers);
 
+uint8_t ble_cmd_buffer[BLE_BUFFER_SIZE];
+
 /* Define a work item for delayed advertising restart */
 static struct k_work_delayable adv_work;
 
@@ -134,12 +136,151 @@ BT_GATT_SERVICE_DEFINE(stsensor_svc,
 					  );
 
 ssize_t recv(struct bt_conn *conn,
-					const struct bt_gatt_attr *attr, const void *buf,
-					uint16_t len, uint16_t offset, uint8_t flags)
+const struct bt_gatt_attr *attr, const void *buf,
+uint16_t len, uint16_t offset, uint8_t flags)
 {
-	led_update();
+	/* Check if we have a valid buffer */
+	if (!buf || len == 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
 
-	return 0;
+	/* Prevent buffer overflow */
+	if (offset + len > BLE_BUFFER_SIZE) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	/* Copy the data to our buffer */
+	memcpy(ble_cmd_buffer + offset, buf, len);
+
+	LOG_INF("Received data, %d bytes", len);
+
+	/* Check if this is a single-byte command (for backward compatibility) */
+	if (len == 1) {
+	uint8_t cmd = ble_cmd_buffer[0];
+	LOG_INF("Single-byte command: 0x%02x", cmd);
+
+	/* Handle simple command */
+	switch (cmd) {
+		case CPR_CONTROL_LED_OFF:
+			LOG_INF("Command: LED OFF");
+			led_off();
+			break;
+
+		case CPR_CONTROL_LED_ON:
+			LOG_INF("Command: LED ON");
+			led_on();
+			break;
+
+		case CPR_CONTROL_START:
+			LOG_INF("Command: Start CPR");
+			/* Add CPR start implementation here */
+			break;
+
+		case CPR_COMMAND_STOP:
+			LOG_INF("Command: Stop CPR");
+			/* Add CPR stop implementation here */
+			break;
+
+		default:
+			LOG_WRN("Unknown single-byte command: 0x%02x", cmd);
+			break;
+		}
+
+		return len;
+	}
+
+	/* For multi-byte commands, try to process using the structured protocol */
+	process_ble_command(ble_cmd_buffer, len);
+
+	return len;
+}
+
+/* Process commands received via BLE */
+void process_ble_command(uint8_t *cmd_data, uint16_t len)
+{
+	/* Validate protocol structure:
+	 * [START][LENGTH][COLON][DATA...][SEMICOLON][END]
+	 * Minimum size: 5 bytes (START, LENGTH, COLON, SEMICOLON, END with no data)
+	 */
+	if (len < 5) {
+		LOG_WRN("Command too short, %d bytes", len);
+		return;
+	}
+
+	/* Check start byte */
+	if (cmd_data[0] != BLE_COMMAND_BYTE_START) {
+		LOG_WRN("Invalid start byte: 0x%02x, expected 0x%02x",
+				cmd_data[0], BLE_COMMAND_BYTE_START);
+		return;
+	}
+
+	/* Check length byte and validate actual length */
+	uint8_t data_len = cmd_data[1];
+	if (data_len > (len - 5)) {
+		LOG_WRN("Data length mismatch: expected %d bytes, got %d",
+				data_len, (len - 5));
+		return;
+	}
+
+	/* Check colon byte */
+	if (cmd_data[2] != BLE_COMMAND_MSG_COLON) {
+		LOG_WRN("Invalid colon byte: 0x%02x, expected 0x%02x",
+				cmd_data[2], BLE_COMMAND_MSG_COLON);
+		return;
+	}
+
+	/* Check end structure */
+	if (cmd_data[3 + data_len] != BLE_COMMAND_MSG_SEMICOLON) {
+		LOG_WRN("Invalid semicolon byte at position %d", 3 + data_len);
+		return;
+	}
+
+	if (cmd_data[4 + data_len] != BLE_COMMAND_MSG_END) {
+		LOG_WRN("Invalid end byte at position %d", 4 + data_len);
+		return;
+	}
+
+	/* Message is valid, process the data */
+	LOG_INF("Valid message received, data length: %d", data_len);
+
+	/* Process the command - data starts at index 3 */
+	if (data_len > 0) {
+		uint8_t command = cmd_data[3]; /* First byte of data */
+
+		switch (command) {
+			case CPR_CONTROL_LED_OFF:
+				LOG_INF("Command: LED OFF");
+				led_off();
+				break;
+
+			case CPR_CONTROL_LED_ON:
+				LOG_INF("Command: LED ON");
+				led_on();
+				break;
+
+			case CPR_CONTROL_START:
+				LOG_INF("Command: Start CPR");
+				/* Add CPR start implementation here */
+				break;
+
+			case CPR_COMMAND_STOP:
+				LOG_INF("Command: Stop CPR");
+				/* Add CPR stop implementation here */
+				break;
+
+			default:
+				LOG_WRN("Unknown command: 0x%02x", command);
+				/* Dump all data bytes for debugging */
+				LOG_INF("Data bytes:");
+				for (int i = 0; i < data_len; i++) {
+					printk("0x%02x ", cmd_data[3 + i]);
+				}
+				printk("\n");
+				break;
+		}
+	} else {
+		LOG_WRN("Valid message structure but no data");
+	}
 }
 
 /* Handler for iOS app commands */

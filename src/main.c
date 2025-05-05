@@ -60,6 +60,7 @@ int main(void)
     /* Note: CAN initialization will be done as part of BLE initialization */
     /* in the bt_ready callback to ensure proper ordering */
 
+
     /* Initialize the Bluetooth Subsystem */
     err = bt_enable(bt_ready);
     if (err)

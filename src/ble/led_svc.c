@@ -31,6 +31,28 @@ void led_update(void)
 	gpio_pin_set(led.port, led.pin, led_state);
 }
 
+void led_on(void)
+{
+	if (!led_ok) {
+		return;
+	}
+
+	led_state = 1;
+	LOG_INF("Turn %s LED", led_state ? "on" : "off");
+	gpio_pin_set(led.port, led.pin, led_state);
+}
+
+void led_off(void)
+{
+	if (!led_ok) {
+		return;
+	}
+
+	led_state = 0;
+	LOG_INF("Turn %s LED", led_state ? "on" : "off");
+	gpio_pin_set(led.port, led.pin, led_state);
+}
+
 int led_init(void)
 {
 	int ret;
