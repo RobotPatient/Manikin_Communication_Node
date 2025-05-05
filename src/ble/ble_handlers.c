@@ -15,8 +15,6 @@ static struct k_work_delayable adv_work;
 /* Button value. */
 static uint16_t but_val;
 
-/* User identification data is now handled by the message processor module */
-
 /* Command buffer for receiving data from iOS */
 static uint8_t ios_cmd_buffer[20];
 
@@ -177,17 +175,6 @@ uint16_t len, uint16_t offset, uint8_t flags)
 	return len;
 }
 
-/**
- * detect_and_print_user_role() 
- *   scans cmd_data[3..] for the "in:" or "tr:" prefix,
- *   extracts the rest as the user‐ID,
- *   and prints both role and ID.
- * 
- * @param cmd_data: full buffer (header + payload)
- * @param data_len: length of payload starting at cmd_data[3]
- * @param len:      total length of cmd_data[]
- * @return USER_ROLE_INSTRUCTOR or USER_ROLE_TRAINEE on success, 0 on failure
- */
 /* Process commands received via BLE - this now delegates to the message processor */
 void process_ble_command(uint8_t *cmd_data, uint16_t len)
 {
@@ -514,8 +501,6 @@ void disconnected(struct bt_conn *disconn, uint8_t reason)
         k_work_schedule(&adv_work, K_MSEC(500));
     }
 }
-
-/* The user ID and role functions are now provided by the message_processor module */
 
 /* Work handler function to restart advertising */
 void restart_advertising(struct k_work *work)

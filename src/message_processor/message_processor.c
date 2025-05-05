@@ -19,6 +19,10 @@ static char instructor_id[MSG_BUFFER_SIZE/2];
 static char trainee_id[MSG_BUFFER_SIZE/2];
 static uint8_t current_user_role = USER_ROLE_NONE;
 
+/* Time data storage in format YYYYMMDDHHMMSSMS */
+static char time_data[18];
+static bool has_time_data = false;
+
 /* Message queue for asynchronous processing */
 K_MSGQ_DEFINE(command_msgq, MSG_BUFFER_SIZE, MSG_QUEUE_SIZE, 4);
 
@@ -142,6 +146,65 @@ static void process_id_string(const uint8_t *data, size_t len, bool is_instructo
             id_storage);
     
     /* Request LED on */
+    request_led_state(true);
+}
+
+/**
+ * Private helper for processing time data
+ */
+static void process_time_data(const uint8_t *data_payload, size_t data_len)
+{
+    /* Expected format: YYYYMMDDHHMMSSMS (14 or 16 characters) */
+    const size_t expected_time_len_min = 14;  /* At minimum, we need YYYYMMDDHHMMSS */
+    
+    /* Print raw time data for debugging */
+    LOG_INF("Time Data received, %d bytes", data_len);
+    
+    /* Print hex bytes for debugging */
+    LOG_INF("Time Data bytes:");
+    for (int i = 0; i < data_len; i++) {
+        printk("%02x ", data_payload[i]);
+    }
+    printk("\n");
+    
+    /* Also print as ASCII */
+    LOG_INF("Time Data as ASCII: ");
+    for (int i = 0; i < data_len && i < sizeof(time_data) - 1; i++) {
+        printk("%c", data_payload[i]);
+    }
+    printk("\n");
+    
+    /* Validate data length */
+    if (data_len < expected_time_len_min) {
+        LOG_WRN("Time data too short: %d bytes, expected at least %d", 
+                data_len, expected_time_len_min);
+        return;
+    }
+    
+    /* Copy time data safely (with null-termination) */
+    memset(time_data, 0, sizeof(time_data));
+    size_t copy_len = data_len < sizeof(time_data) - 1 ? data_len : sizeof(time_data) - 1;
+    memcpy(time_data, data_payload, copy_len);
+    time_data[copy_len] = '\0';
+    
+    has_time_data = true;
+    
+    /* Parse the time components, adjusting output based on data length */
+    LOG_INF("Received timestamp: %s", time_data);
+    
+    if (copy_len >= 14) {
+        LOG_INF("Year: %.4s, Month: %.2s, Day: %.2s", 
+                time_data, time_data + 4, time_data + 6);
+        LOG_INF("Hour: %.2s, Minute: %.2s, Second: %.2s", 
+                time_data + 8, time_data + 10, time_data + 12);
+                
+        /* If milliseconds are included */
+        if (copy_len >= 16) {
+            LOG_INF("Millisecond: %.2s", time_data + 14);
+        }
+    }
+            
+    /* Request LED on to provide visual feedback that time was received */
     request_led_state(true);
 }
 
@@ -322,6 +385,12 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
                 /* Process the CPR data payload - handling ID strings safely */
                 process_cpr_data(&cmd_data[3], data_len);
             }
+            else if (command == CMD_COMMAND_TIMEDATA) {
+                LOG_INF("Command: Received Time Data");
+                
+                /* Process the time data payload (command byte is already at index 3) */
+                process_time_data(&cmd_data[4], data_len - 1);
+            }
             else {
                 LOG_WRN("Unknown command: 0x%02x", command);
                 return -EINVAL;
@@ -379,6 +448,42 @@ size_t get_trainee_id(char *buffer, size_t size)
 uint8_t get_user_role(void)
 {
     return current_user_role;
+}
+
+/**
+ * @brief Get the current time data
+ * 
+ * @param buffer Buffer to fill with the time data
+ * @param size Size of the buffer
+ * @return Length of the time data string, 0 if no time data is set
+ */
+size_t get_time_data(char *buffer, size_t size)
+{
+    if (!buffer || size == 0 || !has_time_data) {
+        return 0;
+    }
+    
+    size_t time_len = strlen(time_data);
+    if (time_len == 0) {
+        buffer[0] = '\0';
+        return 0;
+    }
+    
+    size_t copy_len = (time_len < size - 1) ? time_len : size - 1;
+    memcpy(buffer, time_data, copy_len);
+    buffer[copy_len] = '\0';
+    
+    return copy_len;
+}
+
+/**
+ * @brief Check if time data has been received
+ * 
+ * @return True if time data has been received, false otherwise
+ */
+bool has_received_time_data(void)
+{
+    return has_time_data;
 }
 
 /**

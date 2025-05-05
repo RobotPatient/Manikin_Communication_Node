@@ -27,6 +27,7 @@
 #define CMD_CONTROL_START            0x02
 #define CMD_COMMAND_STOP             0x03
 #define CMD_COMMAND_DATA             0x04
+#define CMD_COMMAND_TIMEDATA         0x05
 
 /* User role identifiers */
 #define USER_ROLE_INSTRUCTOR_PREFIX  "in:"
@@ -34,6 +35,7 @@
 #define USER_ROLE_INSTRUCTOR         1
 #define USER_ROLE_TRAINEE            2
 #define USER_ROLE_NONE               0
+
 
 /* Maximum buffer size for processing */
 #define MSG_BUFFER_SIZE             40
@@ -102,6 +104,22 @@ size_t get_trainee_id(char *buffer, size_t size);
  * @return USER_ROLE_INSTRUCTOR, USER_ROLE_TRAINEE, or USER_ROLE_NONE
  */
 uint8_t get_user_role(void);
+
+/**
+ * @brief Get the current time data
+ * 
+ * @param buffer Buffer to fill with the time data
+ * @param size Size of the buffer
+ * @return Length of the time data string, 0 if no time data is set
+ */
+size_t get_time_data(char *buffer, size_t size);
+
+/**
+ * @brief Check if time data has been received
+ * 
+ * @return True if time data has been received, false otherwise
+ */
+bool has_received_time_data(void);
 
 #ifdef __cplusplus
 }

@@ -38,6 +38,7 @@
 #define CPR_CONTROL_START            CMD_CONTROL_START
 #define CPR_COMMAND_STOP             CMD_COMMAND_STOP
 #define CPR_COMMAND_DATA             CMD_COMMAND_DATA
+#define CPR_COMMAND_TIMEDATA         CMD_COMMAND_TIMEDATA
 
 #ifdef __cplusplus
 extern "C" {
