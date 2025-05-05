@@ -42,40 +42,39 @@ static void processor_thread_func(void *arg1, void *arg2, void *arg3)
 {
     uint8_t cmd_buffer[MSG_BUFFER_SIZE];
     int ret;
-    
+
     LOG_INF("Message processor thread started");
-    
+
     while (1) {
         /* Wait for a command to arrive in the queue */
-        if (k_msgq_get(&command_msgq, cmd_buffer, K_FOREVER) == 0) {
-            /* Extract command type and length from buffer */
+        ret = k_msgq_get(&command_msgq, cmd_buffer, K_FOREVER);
+        
+        if (ret == 0) {
+            /* Message received successfully */
             uint8_t cmd_type = cmd_buffer[0];
             uint16_t cmd_len = 0;
-            
-            /* Minimal logging to reduce stack usage */
-            LOG_INF("Processing command type: %d", cmd_type);
             
             if (cmd_type == 0) {
                 /* Single byte direct command */
                 uint8_t cmd_byte = cmd_buffer[1];
-                
-                ret = process_direct_command(cmd_byte);
-                if (ret) {
-                    LOG_WRN("Error processing direct command: %d", ret);
-                }
+                LOG_INF("Processing direct command: 0x%02x", cmd_byte);
+                process_direct_command(cmd_byte);
             } else {
                 /* Full command buffer */
                 cmd_len = (cmd_buffer[1] << 8) | cmd_buffer[2];
-
-                if (cmd_len > 3) {
-                    LOG_INF("Command: %d", cmd_buffer[3]);
+                LOG_INF("Processing command with data length: %d bytes", cmd_len);
+                
+                /* Print first 4 bytes of data if available */
+                if (cmd_len >= 4) {
+                    LOG_INF("Data starts with: %02x %02x %02x %02x", 
+                        cmd_buffer[3], cmd_buffer[4], cmd_buffer[5], cmd_buffer[6]);
                 }
                 
-                ret = process_command(&cmd_buffer[3], cmd_len);
-                if (ret) {
-                    LOG_WRN("Error processing command: %d", ret);
-                }
+                process_command(&cmd_buffer[3], cmd_len);
             }
+        } else {
+            /* Error handling with minimal logging */
+            k_sleep(K_MSEC(10));
         }
     }
 }
@@ -258,21 +257,20 @@ static int process_direct_command(uint8_t cmd_byte)
 
 static int process_command(uint8_t *cmd_data, uint16_t len)
 {
-    LOG_INF("Processing command data with length: %d", len);
-    LOG_INF("Start byte: 0x%02x", cmd_data[0]);
+    /* Check specifically for timedata command right away */
+    if (len > 4 && cmd_data[0] == MSG_COMMAND_BYTE_START && 
+        cmd_data[2] == MSG_COMMAND_MSG_COLON && cmd_data[3] == CMD_COMMAND_TIMEDATA) {
+        LOG_INF("*** TIME DATA COMMAND DETECTED! ***");
+    }
     
-    /* Simplified logging for safety */
-    LOG_INF("First bytes: %02x %02x %02x %02x", 
+    /* Basic command logging */
+    LOG_INF("Command format: [%02x][%02x][%02x][%02x]...", 
            (len > 0) ? cmd_data[0] : 0,
            (len > 1) ? cmd_data[1] : 0,
            (len > 2) ? cmd_data[2] : 0,
            (len > 3) ? cmd_data[3] : 0);
            
-    /* Check specifically for timedata command with safer bounds checking */
-    if (len > 4 && cmd_data[0] == MSG_COMMAND_BYTE_START && 
-        cmd_data[2] == MSG_COMMAND_MSG_COLON && cmd_data[3] == CMD_COMMAND_TIMEDATA) {
-        LOG_INF("Time data command found");
-    }
+    /* Already checked for timedata command above */
     
     /* Check for direct text ID formats (no protocol framing) */
     size_t instr_prefix_len = strlen(USER_ROLE_INSTRUCTOR_PREFIX);
@@ -388,7 +386,14 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
                 process_cpr_data(&cmd_data[3], data_len);
             }
             else if (command == CMD_COMMAND_TIMEDATA) {
-                LOG_INF("Command: Received Time Data");
+                LOG_INF("*** EXECUTING TIME DATA COMMAND ***");
+                
+                /* Log the raw time data in hex */
+                LOG_INF("Time payload (%d bytes): ", data_len);
+                for (int i = 0; i < data_len && i < 20; i++) {
+                    printk("%02x ", cmd_data[3 + i]);
+                }
+                printk("\n");
                 
                 /* Safety check for data length */
                 if (data_len > 1) {

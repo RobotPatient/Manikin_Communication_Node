@@ -156,7 +156,8 @@ uint16_t len, uint16_t offset, uint8_t flags)
 	/* Copy the data to our buffer */
 	memcpy(ble_cmd_buffer + offset, buf, len);
 
-	/* No logging here to minimize stack usage */
+	/* Minimal logging showing just the length */
+	LOG_INF("BLE data received, length: %d bytes", len);
 
 	/* Check if this is a single-byte command (for backward compatibility) */
 	if (len == 1) {
