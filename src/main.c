@@ -32,6 +32,39 @@ K_TIMER_DEFINE(my_timer, ttcan_timer_trigger, ttcan_timer_stop);
 
 ttcan_timer_type_t fake_handle;
 
+/* Thread function to handle LED control independently of BLE thread */
+void led_control_thread_fn(void *arg1, void *arg2, void *arg3)
+{
+    ARG_UNUSED(arg1);
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+
+    while (1) {
+        /* Check if there's a pending LED control request */
+        if (led_request_pending) {
+            led_request_pending = false;
+            LOG_INF("Processing LED request: %s", led_requested_state ? "ON" : "OFF");
+            
+            /* Handle the LED request from this thread where it's safe */
+            if (led_requested_state) {
+                led_on();
+            } else {
+                led_off();
+            }
+        }
+        
+        /* Sleep for a short time to avoid hogging CPU */
+        k_sleep(K_MSEC(10));
+    }
+}
+
+/* Define a dedicated thread for LED control with sufficient stack */
+#define LED_CONTROL_STACK_SIZE 1024
+#define LED_CONTROL_PRIORITY 7
+K_THREAD_DEFINE(led_control_tid, LED_CONTROL_STACK_SIZE,
+                led_control_thread_fn, NULL, NULL, NULL,
+                LED_CONTROL_PRIORITY, 0, 0);
+
 int main(void)
 {
     /* raw disk i/o */
@@ -60,13 +93,15 @@ int main(void)
     /* Note: CAN initialization will be done as part of BLE initialization */
     /* in the bt_ready callback to ensure proper ordering */
 
-
     /* Initialize the Bluetooth Subsystem */
     err = bt_enable(bt_ready);
     if (err)
     {
         LOG_ERR("Bluetooth init failed (err %d)", err);
     }
-
-    return 0;
+    
+    /* Never return - let the threads run */
+    while (1) {
+        k_sleep(K_SECONDS(1));
+    }
 }

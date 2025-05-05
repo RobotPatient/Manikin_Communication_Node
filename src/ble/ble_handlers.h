@@ -35,6 +35,7 @@
 #define CPR_CONTROL_LED_ON           0x01
 #define CPR_CONTROL_START            0x02
 #define CPR_COMMAND_STOP             0x03
+#define CPR_COMMAND_DATA             0x04
 
 /* User role identifiers */
 #define USER_ROLE_INSTRUCTOR_PREFIX  "in:"
@@ -49,6 +50,10 @@ extern "C" {
 /* Buffer for BLE commands */
 extern uint8_t ble_cmd_buffer[BLE_BUFFER_SIZE];
 
+/* LED control flags - for safe LED control from BLE thread */
+extern bool led_request_pending;
+extern bool led_requested_state;
+
 /* Function declarations */
 void bt_ready(int err);
 void button_callback(const struct device *gpiob, struct gpio_callback *cb, uint32_t pins);
@@ -59,6 +64,8 @@ void restart_advertising(struct k_work *work);
 void process_ble_command(uint8_t *cmd_data, uint16_t len);
 void get_user_ids(char *instr_buf, size_t instr_size, char *train_buf, size_t train_size);
 uint8_t get_current_user_role(void);
+// int detect_and_print_user_role(const uint8_t *cmd_data, size_t data_len, size_t len);
+
 
 #ifdef __cplusplus
 }
