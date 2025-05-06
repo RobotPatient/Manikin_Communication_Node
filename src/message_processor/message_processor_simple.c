@@ -23,6 +23,17 @@ static uint8_t current_user_role = USER_ROLE_NONE;
 static char time_data[18];
 static bool has_time_data = false;
 
+/* Base time and timestamp for RTC simulation */
+static struct {
+    int year;
+    int month;
+    int day;
+    int hour;
+    int min;
+    int sec;
+    uint32_t base_ticks;  /* System ticks when time was set */
+} rtc_base;
+
 /* Message queue for asynchronous processing */
 K_MSGQ_DEFINE(command_msgq, MSG_BUFFER_SIZE, MSG_QUEUE_SIZE, 4);
 
@@ -78,6 +89,10 @@ int message_processor_init(void)
     memset(instructor_id, 0, sizeof(instructor_id));
     memset(trainee_id, 0, sizeof(trainee_id));
     current_user_role = USER_ROLE_NONE;
+    
+    /* Clear time data and RTC base */
+    memset(time_data, 0, sizeof(time_data));
+    memset(&rtc_base, 0, sizeof(rtc_base));
     
     /* Start the processor thread */
     processor_tid = k_thread_create(&processor_thread,
@@ -176,7 +191,66 @@ static void process_time_data(const uint8_t *data_payload, size_t data_len)
     /* Log the time data for debugging */
     LOG_INF("Time data received: %s", time_data);
     
+    /* Format for display */
+    if (copy_len >= 14) {
+        /* Extract individual components */
+        char year_str[5] = {0};
+        char month_str[3] = {0};
+        char day_str[3] = {0};
+        char hour_str[3] = {0};
+        char min_str[3] = {0};
+        char sec_str[3] = {0};
+        
+        /* Copy components with null termination */
+        memcpy(year_str, time_data, 4);
+        memcpy(month_str, time_data + 4, 2);
+        memcpy(day_str, time_data + 6, 2);
+        memcpy(hour_str, time_data + 8, 2);
+        memcpy(min_str, time_data + 10, 2);
+        memcpy(sec_str, time_data + 12, 2);
+        
+        /* Convert to integers */
+        int year = atoi(year_str);
+        int month = atoi(month_str);
+        int day = atoi(day_str);
+        int hour = atoi(hour_str);
+        int min = atoi(min_str);
+        int sec = atoi(sec_str);
+        
+        /* Validate ranges */
+        if (year >= 2023 && year <= 2100 && 
+            month >= 1 && month <= 12 &&
+            day >= 1 && day <= 31 &&
+            hour >= 0 && hour <= 23 &&
+            min >= 0 && min <= 59 &&
+            sec >= 0 && sec <= 59) {
+            
+            /* Looks like valid time data */
+            LOG_INF("Parsed time: %04d-%02d-%02d %02d:%02d:%02d", 
+                    year, month, day, hour, min, sec);
+            
+            /* Store the parsed time as our base time */
+            rtc_base.year = year;
+            rtc_base.month = month;
+            rtc_base.day = day;
+            rtc_base.hour = hour;
+            rtc_base.min = min;
+            rtc_base.sec = sec;
+            rtc_base.base_ticks = k_uptime_get_32();
+            
+            LOG_INF("Base time set with system ticks: %u", rtc_base.base_ticks);
+        } else {
+            LOG_WRN("Time data has invalid values: %s", time_data);
+        }
+    }
+    
     /* Request LED on to provide visual feedback that time was received */
+    request_led_state(true);
+    
+    /* Blink LED to indicate time data received (this is better feedback) */
+    k_sleep(K_MSEC(300));
+    request_led_state(false);
+    k_sleep(K_MSEC(300));
     request_led_state(true);
 }
 
@@ -392,21 +466,109 @@ bool has_received_time_data(void)
     return has_time_data;
 }
 
-size_t get_rtc_time(char *buffer, size_t size)
+/* Helper to add seconds to a time and handle carries */
+static void add_seconds_to_time(int *year, int *month, int *day, int *hour, int *min, int *sec, uint32_t seconds)
 {
-    /* Simplified stub - just returns a fixed string */
-    if (!buffer || size < 20) {
-        return 0;
+    static const int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    
+    /* Add seconds */
+    *sec += seconds;
+    
+    /* Carry to minutes */
+    if (*sec >= 60) {
+        *min += *sec / 60;
+        *sec %= 60;
     }
     
-    const char *dummy_time = "2023-01-01 12:00:00";
-    size_t len = strlen(dummy_time);
-    size_t copy_len = (len < size - 1) ? len : size - 1;
+    /* Carry to hours */
+    if (*min >= 60) {
+        *hour += *min / 60;
+        *min %= 60;
+    }
     
-    memcpy(buffer, dummy_time, copy_len);
-    buffer[copy_len] = '\0';
+    /* Carry to days */
+    if (*hour >= 24) {
+        *day += *hour / 24;
+        *hour %= 24;
+    }
     
-    return copy_len;
+    /* Handle month changes - simplified for demonstration */
+    while (1) {
+        /* Check if we need to advance to the next month */
+        int max_days = days_in_month[*month];
+        
+        /* Handle February in leap years */
+        if (*month == 2 && (*year % 4 == 0 && (*year % 100 != 0 || *year % 400 == 0))) {
+            max_days = 29;
+        }
+        
+        if (*day <= max_days) {
+            break;  /* Day is valid for this month */
+        }
+        
+        /* Roll over to next month */
+        *day -= max_days;
+        *month += 1;
+        
+        /* Roll over to next year if needed */
+        if (*month > 12) {
+            *month = 1;
+            *year += 1;
+        }
+    }
+}
+
+size_t get_rtc_time(char *buffer, size_t size)
+{
+    /* If we've received time data, calculate and format current time */
+    if (has_time_data && buffer && size >= 20 && rtc_base.base_ticks != 0) {
+        /* Calculate elapsed time since base time was set */
+        uint32_t current_ticks = k_uptime_get_32();
+        uint32_t elapsed_ms = current_ticks - rtc_base.base_ticks;
+        uint32_t elapsed_sec = elapsed_ms / 1000;
+        
+        /* Don't update too frequently to avoid uint32_t overflow */
+        if (elapsed_sec < 100000000) {  /* ~3 years */
+            /* Start with the base time */
+            int year = rtc_base.year;
+            int month = rtc_base.month;
+            int day = rtc_base.day;
+            int hour = rtc_base.hour;
+            int min = rtc_base.min;
+            int sec = rtc_base.sec;
+            
+            /* Add elapsed seconds */
+            add_seconds_to_time(&year, &month, &day, &hour, &min, &sec, elapsed_sec);
+            
+            /* Format the calculated time */
+            char formatted_time[24];
+            snprintf(formatted_time, sizeof(formatted_time), 
+                     "%04d-%02d-%02d %02d:%02d:%02d",
+                     year, month, day, hour, min, sec);
+            
+            size_t len = strlen(formatted_time);
+            size_t copy_len = (len < size - 1) ? len : size - 1;
+            
+            memcpy(buffer, formatted_time, copy_len);
+            buffer[copy_len] = '\0';
+            
+            return copy_len;
+        }
+    }
+    
+    /* Fallback if no time data or invalid base time */
+    if (buffer && size >= 20) {
+        const char *dummy_time = "2023-01-01 12:00:00";
+        size_t len = strlen(dummy_time);
+        size_t copy_len = (len < size - 1) ? len : size - 1;
+        
+        memcpy(buffer, dummy_time, copy_len);
+        buffer[copy_len] = '\0';
+        
+        return copy_len;
+    }
+    
+    return 0;
 }
 
 /* Pre-allocated static buffer for queue submissions */

@@ -379,9 +379,55 @@ int main(void)
     LOG_INF("Direct LED control test - OFF");
     led_off();
     
-    /* Simple heartbeat in main thread */
+    /* Enhanced heartbeat in main thread with time data display */
     while (1) {
-        LOG_INF("Main thread heartbeat");
+        char time_buffer[24] = {0};
+        char rtc_time[24] = {0};
+        
+        /* First get and display raw time data */
+        if (has_received_time_data()) {
+            size_t time_len = get_time_data(time_buffer, sizeof(time_buffer));
+            if (time_len > 0) {
+                /* Format time data for display: YYYYMMDDHHMMSS -> YYYY-MM-DD HH:MM:SS */
+                char formatted_time[24] = {0};
+                if (time_len >= 14) {
+                    snprintf(formatted_time, sizeof(formatted_time), 
+                             "%.4s-%.2s-%.2s %.2s:%.2s:%.2s",
+                             time_buffer, time_buffer+4, time_buffer+6,
+                             time_buffer+8, time_buffer+10, time_buffer+12);
+                    LOG_INF("Heartbeat - Raw time data: %s", formatted_time);
+                } else {
+                    LOG_INF("Heartbeat - Raw time data available but invalid format: %s", time_buffer);
+                }
+            } else {
+                LOG_INF("Heartbeat - Raw time data empty");
+            }
+        } else {
+            LOG_INF("Heartbeat - No raw time data received yet");
+        }
+        
+        /* Now get and display formatted RTC time */
+        size_t rtc_len = get_rtc_time(rtc_time, sizeof(rtc_time));
+        if (rtc_len > 0) {
+            LOG_INF("====== CURRENT TIME: %s ======", rtc_time);
+        } else {
+            LOG_INF("====== RTC TIME NOT AVAILABLE ======");
+        }
+        
+        /* Get user role information */
+        uint8_t role = get_user_role();
+        if (role != USER_ROLE_NONE) {
+            char id_buffer[20] = {0};
+            if (role == USER_ROLE_INSTRUCTOR) {
+                get_instructor_id(id_buffer, sizeof(id_buffer));
+                LOG_INF("Heartbeat - Role: Instructor, ID: %s", id_buffer);
+            } else if (role == USER_ROLE_TRAINEE) {
+                get_trainee_id(id_buffer, sizeof(id_buffer));
+                LOG_INF("Heartbeat - Role: Trainee, ID: %s", id_buffer);
+            }
+        } else {
+            LOG_INF("Heartbeat - No user role set");
+        }
         
         /* Make sure we can receive instructor ID commands */
         static bool sent_id = false;
@@ -390,6 +436,25 @@ int main(void)
             LOG_INF("Sending test instructor ID: %s", test_id);
             submit_command((const uint8_t *)test_id, strlen(test_id));
             sent_id = true;
+        }
+        
+        /* After 15 seconds, send a test time data command */
+        static bool sent_time = false;
+        if (!sent_time && k_uptime_get_32() > 15000) {
+            LOG_INF("Sending test time data: 20250506150722");
+            
+            /* Format: [Start][Cmd:TimeData][Time:20250506150722][End] */
+            uint8_t time_cmd[] = {
+                MSG_COMMAND_BYTE_START,  /* Start byte */
+                MSG_COMMAND_MSG_COLON,   /* Command separator */
+                CMD_COMMAND_TIMEDATA,    /* Time data command */
+                MSG_COMMAND_MSG_COLON,   /* Data separator */
+                '2', '0', '2', '5', '0', '5', '0', '6', '1', '5', '0', '7', '2', '2', /* Time data */
+                MSG_COMMAND_MSG_END      /* End byte */
+            };
+            
+            submit_command(time_cmd, sizeof(time_cmd));
+            sent_time = true;
         }
         
         k_sleep(K_SECONDS(2));
