@@ -150,10 +150,68 @@ static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 };
 
-/* Empty scan response data to ensure minimal configuration */
-static const struct bt_data sd[] = {
-    /* Keep empty */
-};
+/* Simple delayed advertising function with multiple progressive retries */
+static void start_adv_with_delay(void)
+{
+    /* First, explicitly stop any existing advertising */
+    bt_le_adv_stop();
+    
+    /* Add a longer initial delay to allow resources to be released */
+    LOG_INF("Waiting for BLE resources to be released (2 seconds)");
+    k_sleep(K_SECONDS(2));
+    
+    /* Define the most minimal advertising parameters possible */
+    static const struct bt_le_adv_param param = {
+        .options = BT_LE_ADV_OPT_CONNECTABLE,  /* Use the simpler connectable flag */
+        .interval_min = BT_GAP_ADV_SLOW_INT_MIN,  /* Use slower interval for stability */
+        .interval_max = BT_GAP_ADV_SLOW_INT_MAX,
+        .id = BT_ID_DEFAULT,
+        .sid = 0,
+        .secondary_max_skip = 0,
+        .peer = NULL,
+    };
+    
+    /* Minimal advertising data - just flags */
+    static const uint8_t flag_data[] = { BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR };
+    static const struct bt_data minimal_ad[] = {
+        { BT_DATA_FLAGS, sizeof(flag_data), flag_data },
+    };
+    
+    /* First attempt */
+    LOG_INF("First advertising attempt after 2s delay");
+    int err = bt_le_adv_start(&param, minimal_ad, ARRAY_SIZE(minimal_ad), NULL, 0);
+    if (err) {
+        LOG_ERR("First advertising attempt failed (err %d), retrying in 3s", err);
+        k_sleep(K_SECONDS(3));
+        
+        /* Second attempt - try stopping advertising again first */
+        bt_le_adv_stop();
+        k_sleep(K_MSEC(500));
+        
+        LOG_INF("Second advertising attempt");
+        err = bt_le_adv_start(&param, minimal_ad, ARRAY_SIZE(minimal_ad), NULL, 0);
+        if (err) {
+            LOG_ERR("Second advertising attempt also failed (err %d), retrying in 5s", err);
+            k_sleep(K_SECONDS(5));
+            
+            /* Third attempt - last try */
+            bt_le_adv_stop();
+            k_sleep(K_MSEC(500));
+            
+            LOG_INF("Final advertising attempt");
+            err = bt_le_adv_start(&param, minimal_ad, ARRAY_SIZE(minimal_ad), NULL, 0);
+            if (err) {
+                LOG_ERR("All advertising attempts failed (err %d)", err);
+            } else {
+                LOG_INF("Final advertising attempt successful");
+            }
+        } else {
+            LOG_INF("Second advertising attempt successful");
+        }
+    } else {
+        LOG_INF("First advertising attempt successful");
+    }
+}
 
 /* BT ready callback */
 static void bt_ready(int err)
@@ -171,7 +229,7 @@ static void bt_ready(int err)
     /* Start advertising with basic configuration */
     /* Define parameters manually to avoid deprecation warnings */
     static const struct bt_le_adv_param param = {
-        .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_CONN,
+        .options = BT_LE_ADV_OPT_CONN,
         .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
         .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
         .id = BT_ID_DEFAULT,
@@ -197,13 +255,21 @@ static void connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    LOG_INF("Connected");
+    LOG_INF("**********************************************");
+    LOG_INF("*************** CONNECTED *******************");
+    LOG_INF("**********************************************");
 }
 
 /* Disconnected callback */
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    LOG_INF("Disconnected (reason %u)", reason);
+    LOG_INF("**********************************************");
+    LOG_INF("************* DISCONNECTED: %d *************", reason);
+    LOG_INF("**********************************************");
+    
+    /* Schedule delayed advertising restart */
+    LOG_INF("Scheduling advertising restart after disconnect");
+    start_adv_with_delay();
 }
 
 /* Connection callbacks structure */
@@ -214,6 +280,9 @@ static struct bt_conn_cb conn_callbacks = {
 
 /* Timer to check for LED requests from message processor */
 static struct k_timer led_timer;
+
+/* Forward declaration for advertising timer */
+static void start_adv_with_delay(void);
 
 /* LED timer handler */
 static void led_timer_handler(struct k_timer *timer)
@@ -337,6 +406,8 @@ int main(void)
     /* Initialize LED timer to check for LED requests */
     k_timer_init(&led_timer, led_timer_handler, NULL);
     k_timer_start(&led_timer, K_MSEC(100), K_MSEC(100));  /* Check every 100ms */
+    
+        /* No timer initialization needed for our simplified approach */
     
     /* Initialize the message processor */
     err = message_processor_init();
