@@ -18,7 +18,7 @@ zephyr_include_directories(
 
 target_sources(app PRIVATE
   src/main.c
-  src/minimal_test.c
+  src/basic_implementation.c
   src/can_wrapper_mock.c
   src/message_processor/message_processor_simple.c
   src/ble/led_svc.c

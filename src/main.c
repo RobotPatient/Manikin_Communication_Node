@@ -21,8 +21,8 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 static uint8_t notify_buffer[20] = {0};
 static bool notify_enabled = false;
 
-/* External function from minimal_test.c */
-void minimal_test_init(void);
+/* External function from basic_implementation.c */
+void basic_implementation_init(void);
 
 /* Buffer for storing received data */
 static uint8_t recv_buffer[20];
@@ -171,7 +171,7 @@ static void bt_ready(int err)
     /* Start advertising with basic configuration */
     /* Define parameters manually to avoid deprecation warnings */
     static const struct bt_le_adv_param param = {
-        .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_ONE_TIME,
+        .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_CONN,
         .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
         .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
         .id = BT_ID_DEFAULT,
@@ -316,8 +316,8 @@ int main(void)
     printk("Bluetooth application with GATT service and Message Processor\n");
     LOG_INF("Starting Bluetooth application with GATT service and Message Processor");
     
-    /* Initialize our minimal test module */
-    minimal_test_init();
+    /* Initialize our basic implementation module */
+    basic_implementation_init();
     
     /* Initialize the LED driver */
     err = led_init();
@@ -395,7 +395,7 @@ int main(void)
                              "%.4s-%.2s-%.2s %.2s:%.2s:%.2s",
                              time_buffer, time_buffer+4, time_buffer+6,
                              time_buffer+8, time_buffer+10, time_buffer+12);
-                    LOG_INF("Heartbeat - Raw time data: %s", formatted_time);
+                    //LOG_INF("Heartbeat - Raw time data: %s", formatted_time);
                 } else {
                     LOG_INF("Heartbeat - Raw time data available but invalid format: %s", time_buffer);
                 }

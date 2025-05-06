@@ -7,6 +7,7 @@
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <stdlib.h>
 
 LOG_MODULE_REGISTER(message_processor);
 
@@ -541,10 +542,15 @@ size_t get_rtc_time(char *buffer, size_t size)
             add_seconds_to_time(&year, &month, &day, &hour, &min, &sec, elapsed_sec);
             
             /* Format the calculated time */
-            char formatted_time[24];
-            snprintf(formatted_time, sizeof(formatted_time), 
-                     "%04d-%02d-%02d %02d:%02d:%02d",
-                     year, month, day, hour, min, sec);
+            char formatted_time[80]; // Increased substantially to handle any possible output
+            snprintf(formatted_time, sizeof(formatted_time),
+                    "%04d-%02d-%02d %02d:%02d:%02d",
+                    (year > 9999 || year < 0) ? 9999 : year,  // Handle negative values too
+                    (month > 99 || month < 0) ? 99 : month,
+                    (day > 99 || day < 0) ? 99 : day,
+                    (hour > 99 || hour < 0) ? 99 : hour,
+                    (min > 99 || min < 0) ? 99 : min,
+                    (sec > 99 || sec < 0) ? 99 : sec);
             
             size_t len = strlen(formatted_time);
             size_t copy_len = (len < size - 1) ? len : size - 1;
