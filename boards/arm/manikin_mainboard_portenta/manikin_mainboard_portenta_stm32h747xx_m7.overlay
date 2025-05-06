@@ -1,0 +1,35 @@
+/ {
+    chosen {
+        zephyr,canbus = &fdcan1;
+    };
+    
+    aliases {
+        sw0 = &user_button;
+    };
+    
+    user_button: user_button {
+        compatible = "gpio-keys";
+        button_0 {
+            gpios = <&gpioj 13 GPIO_ACTIVE_LOW>;
+            label = "User Button";
+        };
+    };
+};
+
+&clk_lse {
+    status = "okay";
+    clock-frequency = <32768>;
+};
+
+&rtc {
+    status = "okay";
+    clocks = <&rcc STM32_CLOCK_BUS_APB1 0x00000400>,
+             <&rcc STM32_SRC_LSE RTC_SEL(1)>;
+};
+
+&fdcan1 {
+    status = "okay";
+    pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>; /* Adjust pins as needed */
+    pinctrl-names = "default";
+    bus-speed = <125000>;
+};

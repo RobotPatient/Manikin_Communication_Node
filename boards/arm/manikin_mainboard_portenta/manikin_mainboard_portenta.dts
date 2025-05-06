@@ -1,0 +1,34 @@
+/dts-v1/;
+#include <arm/armv7-m.dtsi>
+
+/ {
+    model = "Manikin Mainboard Portenta";
+    compatible = "robotpatient,manikin-mainboard-portenta";
+
+    chosen {
+        zephyr,console = &usart1;
+        zephyr,shell-uart = &usart1;
+        zephyr,sram = &sram0;
+        zephyr,flash = &flash0;
+    };
+
+    soc {
+        compatible = "st,stm32h747", "st,stm32h7x", "simple-bus";
+        
+        flash0: flash@8000000 {
+            compatible = "soc-nv-flash";
+            reg = <0x08000000 0x200000>; /* 2MB */
+        };
+
+        sram0: memory@20000000 {
+            compatible = "mmio-sram";
+            reg = <0x20000000 0x80000>; /* 512KB */
+        };
+
+        usart1: serial@40011000 {
+            compatible = "st,stm32-usart", "st,stm32-uart";
+            reg = <0x40011000 0x400>;
+            status = "okay";
+        };
+    };
+};

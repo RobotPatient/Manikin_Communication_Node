@@ -121,6 +121,15 @@ size_t get_time_data(char *buffer, size_t size);
  */
 bool has_received_time_data(void);
 
+/**
+ * @brief Get the current time from the RTC
+ * 
+ * @param buffer Buffer to fill with the current time in format "YYYY-MM-DD HH:MM:SS"
+ * @param size Size of the buffer (should be at least 20 bytes)
+ * @return Length of the time string written to the buffer, 0 on error
+ */
+size_t get_rtc_time(char *buffer, size_t size);
+
 #ifdef __cplusplus
 }
 #endif

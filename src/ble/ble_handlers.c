@@ -1,5 +1,6 @@
 #include "ble_handlers.h"
 #include <zephyr/drivers/can.h>
+#include "ble_can_interface.h"
 
 LOG_MODULE_REGISTER(ble_handlers);
 
@@ -272,23 +273,10 @@ void process_ios_command(uint8_t *cmd_data, uint16_t len)
     }
 }
 
-/* Function to send a CAN message */
-void send_can_message(uint32_t can_id, uint8_t *data, uint8_t len)
-{
-    LOG_INF("DUMMY CAN TX - ID: 0x%08x, Length: %d", can_id, len);
-    
-    /* Print the data bytes if available */
-    if (data != NULL && len > 0) {
-        LOG_INF("DUMMY CAN TX - Data:");
-        for (int i = 0; i < len && i < 8; i++) {
-            printk("0x%02x ", data[i]);
-        }
-        printk("\n");
-    }
-    
-    /* Just a placeholder for now */
-    /* We'll implement actual CAN transmission later */
-}
+/* 
+ * The send_can_message function has been moved to can_wrapper_mock.c
+ * to centralize all CAN-related functionality.
+ */
 
 /* Circular buffer for CAN data */
 #define CAN_BUFFER_SIZE 10  /* Number of CAN frames to buffer */
@@ -426,40 +414,14 @@ void button_callback(const struct device *gpiob, struct gpio_callback *cb,
 	}
 }
 
-/* Updated bt_ready function with work queue initialization */
+/* 
+ * STUB bt_ready function that does nothing 
+ * (BLE functionality disabled for debugging)
+ */
 void bt_ready(int err)
 {
-    if (err) {
-        LOG_ERR("Bluetooth init failed (err %d)", err);
-        return;
-    }
-    
-    LOG_INF("Bluetooth initialized");
-    
-    /* Initialize the advertising restart work queue */
-    k_work_init_delayable(&adv_work, restart_advertising);
-    
-    /* Make sure there are no active connections */
-    if (ble_conn) {
-        bt_conn_unref(ble_conn);
-        ble_conn = NULL;
-    }
-    
-    /* Stop any active advertising first */
-    err = bt_le_adv_stop();
-    if (err && err != -EALREADY) {
-        LOG_WRN("Failed to stop advertising (err %d)", err);
-        /* Continue anyway */
-    }
-    
-    /* Start advertising */
-    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err) {
-        LOG_ERR("Advertising failed to start (err %d)", err);
-        return;
-    }
-
-    LOG_INF("Advertising started, waiting for connections");
+    /* This function is a stub - BLE is disabled */
+    LOG_INF("BT_READY stub called - BLE is disabled");
 }
 
 void connected(struct bt_conn *connected, uint8_t err)

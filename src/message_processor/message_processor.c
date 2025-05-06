@@ -7,6 +7,7 @@
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <stdlib.h>
 
 LOG_MODULE_REGISTER(message_processor);
 
@@ -158,9 +159,7 @@ static void process_id_string(const uint8_t *data, size_t len, bool is_instructo
 }
 
 /**
- * Private helper for processing time data
- * 
- * Optimized version with minimal stack usage and reduced logging
+ * Private helper for processing time data and setting the RTC
  */
 static void process_time_data(const uint8_t *data_payload, size_t data_len)
 {
@@ -181,13 +180,122 @@ static void process_time_data(const uint8_t *data_payload, size_t data_len)
     /* Mark as valid */
     has_time_data = true;
     
-    /* Single minimal log message */
-    LOG_INF("Time data set: %.4s-%.2s-%.2s %.2s:%.2s:%.2s", 
-            time_data, time_data + 4, time_data + 6,
-            time_data + 8, time_data + 10, time_data + 12);
+    /* Parse the string values to integers for RTC setting */
+    uint16_t year = 0;
+    uint8_t month = 0, day = 0, hour = 0, minute = 0, second = 0, millisecond = 0;
     
-    /* Parse time into system time if needed */
-    /* TODO: Future enhancement - convert to system time and sync RTC */
+    /* Extract time components with sscanf - using temporary buffer for each component */
+    char temp[5];
+    
+    /* Year: First 4 characters */
+    memcpy(temp, time_data, 4);
+    temp[4] = '\0';
+    year = (uint16_t)atoi(temp);
+    
+    /* Month: Characters 4-5 */
+    memcpy(temp, time_data + 4, 2);
+    temp[2] = '\0';
+    month = (uint8_t)atoi(temp);
+    
+    /* Day: Characters 6-7 */
+    memcpy(temp, time_data + 6, 2);
+    temp[2] = '\0';
+    day = (uint8_t)atoi(temp);
+    
+    /* Hour: Characters 8-9 */
+    memcpy(temp, time_data + 8, 2);
+    temp[2] = '\0';
+    hour = (uint8_t)atoi(temp);
+    
+    /* Minute: Characters 10-11 */
+    memcpy(temp, time_data + 10, 2);
+    temp[2] = '\0';
+    minute = (uint8_t)atoi(temp);
+    
+    /* Second: Characters 12-13 */
+    memcpy(temp, time_data + 12, 2);
+    temp[2] = '\0';
+    second = (uint8_t)atoi(temp);
+    
+    /* Millisecond: Characters 14-15 if available */
+    if (copy_len >= 16) {
+        memcpy(temp, time_data + 14, 2);
+        temp[2] = '\0';
+        millisecond = (uint8_t)atoi(temp);
+    }
+    
+    /* Log the extracted time components */
+    LOG_INF("Time: %04u-%02u-%02u %02u:%02u:%02u.%02u", 
+            year, month, day, hour, minute, second, millisecond);
+    
+    /* Set the RTC using the STM32 HAL */
+    RTC_TimeTypeDef rtc_time = {0};
+    RTC_DateTypeDef rtc_date = {0};
+    
+    /* Set the time */
+    rtc_time.Hours = hour;
+    rtc_time.Minutes = minute; 
+    rtc_time.Seconds = second;
+    rtc_time.TimeFormat = RTC_HOURFORMAT_24;
+    rtc_time.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    rtc_time.StoreOperation = RTC_STOREOPERATION_RESET;
+    
+    /* Set the date - using a fixed weekday since it's not important */
+    rtc_date.WeekDay = RTC_WEEKDAY_MONDAY; 
+    rtc_date.Month = month;
+    rtc_date.Date = day;
+    rtc_date.Year = year - 2000; /* RTC year is typically offset from 2000 */
+    
+    /* Get RTC handle and set the time */
+    static RTC_HandleTypeDef hrtc = {0};
+    static bool rtc_initialized = false;
+    
+    /* Initialize RTC only once */
+    if (!rtc_initialized) {
+        LOG_INF("Initializing RTC...");
+        hrtc.Instance = RTC;
+        hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+        hrtc.Init.AsynchPrediv = 127;
+        hrtc.Init.SynchPrediv = 255;
+        hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+        hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+        hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+        
+        /* Initialize RTC */
+        if (HAL_RTC_Init(&hrtc) != HAL_OK) {
+            LOG_ERR("Failed to initialize RTC");
+            /* Handle RTC init failure - you might want to try alternate approaches */
+        } else {
+            rtc_initialized = true;
+            LOG_INF("RTC initialized successfully");
+        }
+    }
+    
+    /* Only proceed if RTC is initialized */
+    if (rtc_initialized) {
+        /* Set time and date */
+        if (HAL_RTC_SetTime(&hrtc, &rtc_time, RTC_FORMAT_BIN) != HAL_OK) {
+            LOG_ERR("Failed to set RTC time");
+        }
+        
+        if (HAL_RTC_SetDate(&hrtc, &rtc_date, RTC_FORMAT_BIN) != HAL_OK) {
+            LOG_ERR("Failed to set RTC date");
+        }
+        
+        /* Read back the time to verify it was set correctly */
+        RTC_TimeTypeDef rtc_time_check = {0};
+        RTC_DateTypeDef rtc_date_check = {0};
+        
+        HAL_RTC_GetTime(&hrtc, &rtc_time_check, RTC_FORMAT_BIN);
+        HAL_RTC_GetDate(&hrtc, &rtc_date_check, RTC_FORMAT_BIN);
+        
+        LOG_INF("RTC time set to: %02d:%02d:%02d", 
+                rtc_time_check.Hours, rtc_time_check.Minutes, rtc_time_check.Seconds);
+        LOG_INF("RTC date set to: %04d-%02d-%02d", 
+                rtc_date_check.Year + 2000, rtc_date_check.Month, rtc_date_check.Date);
+    }
+    
+    LOG_INF("RTC updated successfully");
     
     /* Request LED on to provide visual feedback that time was received */
     request_led_state(true);
@@ -496,6 +604,57 @@ size_t get_time_data(char *buffer, size_t size)
 bool has_received_time_data(void)
 {
     return has_time_data;
+}
+
+/**
+ * @brief Get the current time from the RTC
+ *
+ * Reads the current time from the system RTC and formats it into a string
+ * 
+ * @param buffer Buffer to fill with the current time
+ * @param size Size of the buffer
+ * @return Length of the time string written, 0 on error
+ */
+size_t get_rtc_time(char *buffer, size_t size)
+{
+    /* Safety check */
+    if (!buffer || size < 20) {
+        return 0;
+    }
+    
+    /* Initialize RTC handle */
+    static RTC_HandleTypeDef hrtc = {0};
+    static bool rtc_initialized = false;
+    
+    /* Only initialize once */
+    if (!rtc_initialized) {
+        hrtc.Instance = RTC;
+        hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+        hrtc.Init.AsynchPrediv = 127;
+        hrtc.Init.SynchPrediv = 255;
+        hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+        
+        if (HAL_RTC_Init(&hrtc) != HAL_OK) {
+            /* RTC not initialized, can't read time */
+            snprintf(buffer, size, "RTC not available");
+            return strlen(buffer);
+        }
+        rtc_initialized = true;
+    }
+    
+    /* Read current time and date */
+    RTC_TimeTypeDef sTime = {0};
+    RTC_DateTypeDef sDate = {0};
+    
+    HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+    
+    /* Format time string */
+    int len = snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d:%02d",
+                      sDate.Year + 2000, sDate.Month, sDate.Date,
+                      sTime.Hours, sTime.Minutes, sTime.Seconds);
+                      
+    return (len > 0) ? len : 0;
 }
 
 /**

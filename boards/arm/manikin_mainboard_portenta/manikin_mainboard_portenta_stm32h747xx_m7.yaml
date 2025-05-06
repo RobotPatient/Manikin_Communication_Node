@@ -1,5 +1,5 @@
-identifier: robotpatient_manikin_portenta/stm32h747xx/m7
-name: Robotpatient Manikin Mainboard Portenta (M7)
+identifier: manikin_mainboard_portenta_stm32h747xx_m7
+name: "Manikin Mainboard Portenta STM32H747xx M7"
 type: mcu
 arch: arm
 toolchain:

@@ -1,0 +1,14 @@
+source "Kconfig.zephyr"
+
+config APP_STM32HAL
+    bool
+    default y
+    depends on SOC_FAMILY_STM32
+    select HAS_STM32CUBE
+    select USE_STM32_HAL_CORTEX
+    select USE_STM32_HAL_RCC
+    select USE_STM32_HAL_GPIO
+    select USE_STM32_HAL_RTC
+    select USE_STM32_HAL_PWR
+    select USE_STM32_HAL_DMA
+    select USE_STM32_HAL_FDCAN

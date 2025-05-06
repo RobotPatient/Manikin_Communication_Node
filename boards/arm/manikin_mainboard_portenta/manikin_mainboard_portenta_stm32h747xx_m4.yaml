@@ -1,4 +1,4 @@
-identifier: robotpatient_manikin_portenta/stm32h747xx/m7
+identifier: manikin_portenta_stm32h747xx_m4
 name:  Robotpatient Manikin Mainboard Portenta (M4)
 type: mcu
 arch: arm

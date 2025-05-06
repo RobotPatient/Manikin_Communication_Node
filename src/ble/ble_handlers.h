@@ -25,7 +25,7 @@
 #define BLE_BUFFER_SIZE 40
 
 /* Include our message processor for command definitions */
-#include "message_processor.h"
+#include "../message_processor/message_processor.h"
 
 /* Backwards compatibility for existing code */
 #define BLE_COMMAND_BYTE_START       MSG_COMMAND_BYTE_START

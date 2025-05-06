@@ -1,0 +1,14 @@
+# Manikin Mainboard Portenta board configuration
+
+config BOARD_MANIKIN_MAINBOARD_PORTENTA
+    bool
+    
+config BOARD_MANIKIN_MAINBOARD_PORTENTA_STM32H747XX_M7
+  bool "Manikin Mainboard Portenta STM32H747XX M7"
+  depends on SOC_STM32H747XX_M7
+  select BOARD_MANIKIN_MAINBOARD_PORTENTA
+
+config BOARD_MANIKIN_MAINBOARD_PORTENTA_STM32H747XX_M4
+    bool "Manikin Mainboard Portenta STM32H747XX M4"
+    depends on SOC_STM32H747XX_M4
+    select BOARD_MANIKIN_MAINBOARD_PORTENTA

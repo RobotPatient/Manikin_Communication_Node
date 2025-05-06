@@ -4,10 +4,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-&clk_lse {
-	clock-frequency = <32768>;
-	status = "okay";
-};
 &gpioh {
+    status = "okay";
+};
+
+&rcc {
+    //rtcsel = <STM32_RCC_RTCSEL_LSE>;
+};
+
+&clk_lse {
+    status = "okay";
+    clock-frequency = <32768>;
+};
+
+&rtc {
     status = "okay";
 };

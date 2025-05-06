@@ -93,7 +93,9 @@ ttcan_scheduler_timer_cb_get_action (ttcan_scheduler_ctx_t *ctx)
     uint8_t               tm_idx;
     uint16_t              next_tm_window;
 
-    if (ctx == NULL || ctx->schedule == NULL)
+    /* More thorough validation to avoid null pointer issues */
+    if (ctx == NULL || ctx->schedule == NULL || ctx->schedule->messages == NULL || 
+        ctx->schedule->num_of_messages == 0)
     {
         return timer_action;
     }
@@ -115,9 +117,12 @@ ttcan_scheduler_timer_cb_get_action (ttcan_scheduler_ctx_t *ctx)
     }
     else
     {
-        tm_idx         = (ctx->curr_sched_idx > ctx->schedule->num_of_messages)
-                             ? 0U
-                             : (uint8_t)ctx->curr_sched_idx;
+        /* Additional bounds checking */
+        if (ctx->curr_sched_idx >= ctx->schedule->num_of_messages) {
+            ctx->curr_sched_idx = 0;
+        }
+        
+        tm_idx = (uint8_t)ctx->curr_sched_idx;
         next_tm_window = ctx->schedule->messages[tm_idx].window_num;
 
         if (next_tm_window == ctx->curr_window)
@@ -131,15 +136,24 @@ ttcan_scheduler_timer_cb_get_action (ttcan_scheduler_ctx_t *ctx)
         }
         ctx->curr_window++;
     }
-    const uint16_t last_window_idx =  ctx->schedule->num_of_messages-1;
-    if(ctx->curr_timeslot < ctx->schedule->messages[last_window_idx].window_num+5) {
-        ctx->curr_timeslot++;
+    
+    /* Add additional bounds check before accessing array elements */
+    if (ctx->schedule->num_of_messages > 0) {
+        const uint16_t last_window_idx = ctx->schedule->num_of_messages - 1;
+        if(ctx->curr_timeslot < ctx->schedule->messages[last_window_idx].window_num+5) {
+            ctx->curr_timeslot++;
+        } else {
+            ctx->curr_timeslot = 0;
+            ctx->curr_window = 0;
+            ctx->curr_sched_idx = 0;
+        }
     } else {
-        ctx->curr_timeslot = 0;
-        ctx->curr_window = 0;
-        ctx->curr_sched_idx = 0;
+        /* No messages in schedule, just increment counter */
+        ctx->curr_timeslot++;
+        if (ctx->curr_timeslot >= 1000) {  /* arbitrary reset value */
+            ctx->curr_timeslot = 0;
+        }
     }
-
 
     return timer_action;
 }

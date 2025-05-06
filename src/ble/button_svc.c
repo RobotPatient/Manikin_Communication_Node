@@ -22,7 +22,12 @@
 
 LOG_MODULE_REGISTER(button_svc);
 
-static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const struct gpio_dt_spec button = {
+    .port = NULL,
+    .pin = 0,
+    .dt_flags = 0
+};
+
 static struct gpio_callback gpio_cb;
 
 int button_init(gpio_callback_handler_t handler)
