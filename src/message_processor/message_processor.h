@@ -36,6 +36,15 @@
 #define USER_ROLE_TRAINEE            2
 #define USER_ROLE_NONE               0
 
+/* CPR session commands */
+#define CMD_CPR_START               0x50
+#define CMD_CPR_STOP                0x51
+
+/* Forward declarations for external CPR functions */
+extern bool is_cpr_session_active(void);
+extern void start_cpr_session(void);
+extern void stop_cpr_session(void);
+
 
 /* Maximum buffer size for processing */
 #define MSG_BUFFER_SIZE             40

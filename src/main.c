@@ -11,11 +11,18 @@
 #include "message_processor/message_processor.h"
 #include "ble/led_svc.h"
 
+
 /* Include message processing commands */
 #include <stdint.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+/* Forward declarations for CPR session management */
+bool is_cpr_session_active(void);
+void start_cpr_session(void);
+void stop_cpr_session(void);
+uint32_t get_cpr_session_time(void);
 
 /* Global notification buffer and state */
 static uint8_t notify_buffer[20] = {0};
@@ -30,6 +37,86 @@ static uint8_t recv_buffer[20];
 /* LED control flags - for message processor */
 bool led_request_pending = false;
 bool led_requested_state = false;
+
+/* CPR session timing */
+static uint32_t cpr_session_start_time = 0;
+static bool cpr_session_active = false;
+
+/* Function to check if CPR session is active */
+bool is_cpr_session_active(void)
+{
+    /* Only log when state changes to reduce noise */
+    static bool last_logged_state = false;
+    if (last_logged_state != cpr_session_active) {
+        LOG_INF("CPR session active check: state changed from %d to %d", 
+                last_logged_state, cpr_session_active);
+        last_logged_state = cpr_session_active;
+    }
+    return cpr_session_active;
+}
+
+/* Function to handle CPR session start */
+void start_cpr_session(void) 
+{
+    LOG_INF("*******************************************");
+    LOG_INF("***** STARTING CPR SESSION *****");
+    LOG_INF("*******************************************");
+    LOG_INF("Current state before start: active=%d, start_time=%u", 
+            cpr_session_active, cpr_session_start_time);
+    
+    /* Always start a new session */
+    cpr_session_active = true;
+    cpr_session_start_time = k_uptime_get_32();
+    LOG_INF("CPR session started - timer initialized at %u", cpr_session_start_time);
+    
+    /* We'll handle BLE notifications in the main loop and led_timer_handler */
+}
+
+/* Function to handle CPR session stop */
+void stop_cpr_session(void)
+{
+    LOG_INF("*******************************************");
+    LOG_INF("***** STOPPING CPR SESSION *****");
+    LOG_INF("*******************************************");
+    LOG_INF("Current state before stop: active=%d, start_time=%u", 
+            cpr_session_active, cpr_session_start_time);
+    
+    if (!cpr_session_active) {
+        LOG_INF("CPR session already inactive - nothing to stop");
+        return;
+    }
+    
+    /* Calculate final duration */
+    uint32_t now = k_uptime_get_32();
+    uint32_t elapsed_ms = 0;
+    if (cpr_session_start_time > 0) {
+        elapsed_ms = now - cpr_session_start_time;
+    }
+    uint32_t elapsed_sec = elapsed_ms / 1000;
+    uint32_t minutes = elapsed_sec / 60;
+    uint32_t seconds = elapsed_sec % 60;
+    
+    LOG_INF("CPR session ended at %u - Duration: %02d:%02d (%u seconds)", 
+            now, minutes, seconds, elapsed_sec);
+    
+    /* Reset session state */
+    cpr_session_active = false;
+    cpr_session_start_time = 0;
+    
+    /* We'll handle BLE notifications in the main loop and led_timer_handler */
+}
+
+/* Function to get current CPR session elapsed time in seconds */
+uint32_t get_cpr_session_time(void)
+{
+    if (!cpr_session_active) {
+        return 0;
+    }
+    
+    uint32_t current_time = k_uptime_get_32();
+    uint32_t elapsed_ms = current_time - cpr_session_start_time;
+    return elapsed_ms / 1000;  /* Return seconds */
+}
 
 /* Timer for sending periodic notifications */
 static struct k_timer notify_timer;
@@ -150,15 +237,17 @@ static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 };
 
-/* Simple delayed advertising function with multiple progressive retries */
-static void start_adv_with_delay(void)
+/* Work queue item for delayed advertising */
+static struct k_work_delayable adv_work;
+
+/* Robust advertising function with work queue handling */
+static void advertising_work_handler(struct k_work *work)
 {
-    /* First, explicitly stop any existing advertising */
-    bt_le_adv_stop();
+    static int retry_count = 0;
+    static int backoff_time = 0;
     
-    /* Add a longer initial delay to allow resources to be released */
-    LOG_INF("Waiting for BLE resources to be released (2 seconds)");
-    k_sleep(K_SECONDS(2));
+    /* Stop any existing advertising */
+    bt_le_adv_stop();
     
     /* Define the most minimal advertising parameters possible */
     static const struct bt_le_adv_param param = {
@@ -177,40 +266,57 @@ static void start_adv_with_delay(void)
         { BT_DATA_FLAGS, sizeof(flag_data), flag_data },
     };
     
-    /* First attempt */
-    LOG_INF("First advertising attempt after 2s delay");
+    /* Calculate backoff time based on retry count with exponential increase */
+    if (retry_count == 0) {
+        backoff_time = 3000; /* 3 seconds for first retry */
+    } else {
+        backoff_time = backoff_time * 2; /* Double the backoff time for each retry */
+        if (backoff_time > 30000) {
+            backoff_time = 30000; /* Max 30 seconds between retries */
+        }
+    }
+    
+    LOG_INF("Advertising attempt #%d", retry_count + 1);
     int err = bt_le_adv_start(&param, minimal_ad, ARRAY_SIZE(minimal_ad), NULL, 0);
+    
     if (err) {
-        LOG_ERR("First advertising attempt failed (err %d), retrying in 3s", err);
-        k_sleep(K_SECONDS(3));
-        
-        /* Second attempt - try stopping advertising again first */
-        bt_le_adv_stop();
-        k_sleep(K_MSEC(500));
-        
-        LOG_INF("Second advertising attempt");
-        err = bt_le_adv_start(&param, minimal_ad, ARRAY_SIZE(minimal_ad), NULL, 0);
-        if (err) {
-            LOG_ERR("Second advertising attempt also failed (err %d), retrying in 5s", err);
-            k_sleep(K_SECONDS(5));
-            
-            /* Third attempt - last try */
+        /* Special handling for common errors */
+        if (err == -ENOMEM) {
+            LOG_ERR("Advertising failed due to memory constraints (ENOMEM), retrying in %d ms", backoff_time);
+        } else if (err == -EALREADY) {
+            LOG_ERR("Advertising already active (EALREADY), stopping and retrying in %d ms", backoff_time);
             bt_le_adv_stop();
-            k_sleep(K_MSEC(500));
-            
-            LOG_INF("Final advertising attempt");
-            err = bt_le_adv_start(&param, minimal_ad, ARRAY_SIZE(minimal_ad), NULL, 0);
-            if (err) {
-                LOG_ERR("All advertising attempts failed (err %d)", err);
-            } else {
-                LOG_INF("Final advertising attempt successful");
-            }
         } else {
-            LOG_INF("Second advertising attempt successful");
+            LOG_ERR("Advertising failed (err %d), retrying in %d ms", err, backoff_time);
+        }
+        
+        retry_count++;
+        
+        /* Limit number of retries to avoid infinite loop */
+        if (retry_count < 10) {
+            /* Schedule next retry with exponential backoff */
+            k_work_schedule(&adv_work, K_MSEC(backoff_time));
+        } else {
+            LOG_ERR("Advertising retry limit reached. Giving up after %d attempts", retry_count);
+            retry_count = 0; /* Reset for next time */
         }
     } else {
-        LOG_INF("First advertising attempt successful");
+        LOG_INF("Advertising started successfully after %d %s", 
+                retry_count, retry_count == 0 ? "attempt" : "retries");
+        retry_count = 0; /* Reset for next time */
     }
+}
+
+/* Start advertising with a delay to allow resource recovery */
+static void start_adv_with_delay(void)
+{
+    LOG_INF("Scheduling advertising with delay to allow resource recovery");
+    
+    /* Stop any existing advertising */
+    bt_le_adv_stop();
+    
+    /* Schedule advertising work with initial delay */
+    k_work_schedule(&adv_work, K_SECONDS(3));
 }
 
 /* BT ready callback */
@@ -226,25 +332,11 @@ static void bt_ready(int err)
     /* The service is already registered automatically by BT_GATT_SERVICE_DEFINE */
     LOG_INF("GATT service ready");
     
-    /* Start advertising with basic configuration */
-    /* Define parameters manually to avoid deprecation warnings */
-    static const struct bt_le_adv_param param = {
-        .options = BT_LE_ADV_OPT_CONN,
-        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
-        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
-        .id = BT_ID_DEFAULT,
-        .sid = 0,
-        .secondary_max_skip = 0,
-        .peer = NULL,
-    };
-    
-    err = bt_le_adv_start(&param, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err) {
-        LOG_ERR("Advertising failed to start (err %d)", err);
-        return;
-    }
+    /* Start advertising using our robust method */
+    LOG_INF("Starting initial advertising");
+    advertising_work_handler(NULL);  /* Start advertising immediately */
 
-    LOG_INF("Advertising started with custom service UUID");
+    LOG_INF("Initial advertising request submitted");
 }
 
 /* Connected callback */
@@ -315,9 +407,82 @@ static void led_timer_handler(struct k_timer *timer)
         }
     }
     
+    /* Check CPR session status and track elapsed time */
+    uint32_t now = k_uptime_get_32();
+    
+    /* Update CPR session time if active */
+    if (is_cpr_session_active()) {
+        uint32_t elapsed_seconds = get_cpr_session_time();
+        
+        /* Log CPR session time every 5 seconds */
+        if (elapsed_seconds % 5 == 0 && elapsed_seconds > 0) {
+            uint32_t minutes = elapsed_seconds / 60;
+            uint32_t seconds = elapsed_seconds % 60;
+            LOG_INF("CPR Session Time: %02d:%02d (elapsed seconds: %u)", 
+                   minutes, seconds, elapsed_seconds);
+            
+            /* If notifications are enabled, send CPR session time */
+            if (notify_enabled) {
+                /* Format: [TYPE=0x30][ELAPSED_SEC] */
+                notify_buffer[0] = 0x30;  /* Message type: CPR Session Time */
+                notify_buffer[1] = (elapsed_seconds >> 24) & 0xFF;
+                notify_buffer[2] = (elapsed_seconds >> 16) & 0xFF;
+                notify_buffer[3] = (elapsed_seconds >> 8) & 0xFF;
+                notify_buffer[4] = elapsed_seconds & 0xFF;
+                
+                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 5);
+                if (err) {
+                    LOG_ERR("CPR session time notification failed (err %d)", err);
+                } else {
+                    LOG_DBG("CPR session time notification sent: %u seconds", elapsed_seconds);
+                }
+            }
+        }
+    }
+    
+    /* Handle CPR session state change notifications */
+    static bool notified_cpr_state = false;
+    
+    /* Only send notification when state changes */
+    if (notified_cpr_state != cpr_session_active) {
+        LOG_INF("CPR session state changed for notification: %d -> %d", 
+                notified_cpr_state, cpr_session_active);
+        
+        /* Send notification only if BLE notifications are enabled */
+        if (notify_enabled) {
+            if (cpr_session_active) {
+                /* Format: [TYPE=0x40][STATE=0x01] */
+                notify_buffer[0] = 0x40;  /* Message type: CPR Session State */
+                notify_buffer[1] = 0x01;  /* State: Active */
+                
+                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 2);
+                if (err) {
+                    LOG_ERR("CPR session start notification failed (err %d)", err);
+                } else {
+                    LOG_INF("CPR session start notification sent successfully");
+                    notified_cpr_state = cpr_session_active;  /* Update notified state only after successful notification */
+                }
+            } else {
+                /* Format: [TYPE=0x40][STATE=0x00] */
+                notify_buffer[0] = 0x40;  /* Message type: CPR Session State */
+                notify_buffer[1] = 0x00;  /* State: Inactive */
+                
+                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 2);
+                if (err) {
+                    LOG_ERR("CPR session stop notification failed (err %d)", err);
+                } else {
+                    LOG_INF("CPR session stop notification sent successfully");
+                    notified_cpr_state = cpr_session_active;  /* Update notified state only after successful notification */
+                }
+            }
+        } else {
+            LOG_INF("BLE notifications not enabled, no CPR state notification sent");
+            notified_cpr_state = cpr_session_active;  /* Update even if no notification is sent */
+        }
+    }
+    
     /* Periodically check if we have user role data to report */
     static uint32_t last_role_check = 0;
-    uint32_t now = k_uptime_get_32();
     
     if (now - last_role_check > 5000) {  /* Check every 5 seconds */
         last_role_check = now;
@@ -407,7 +572,8 @@ int main(void)
     k_timer_init(&led_timer, led_timer_handler, NULL);
     k_timer_start(&led_timer, K_MSEC(100), K_MSEC(100));  /* Check every 100ms */
     
-        /* No timer initialization needed for our simplified approach */
+    /* Initialize the advertising work queue item */
+    k_work_init_delayable(&adv_work, advertising_work_handler);
     
     /* Initialize the message processor */
     err = message_processor_init();
@@ -441,6 +607,17 @@ int main(void)
     LOG_INF("Sending LED OFF command to message processor");
     submit_direct_command(CMD_CONTROL_LED_OFF);
     
+    /* Test CPR session commands */
+    k_sleep(K_SECONDS(2));
+    
+    LOG_INF("Sending CPR START command to message processor");
+    submit_direct_command(CMD_CONTROL_START);
+    
+    k_sleep(K_SECONDS(5));
+    
+    LOG_INF("Sending CPR STOP command to message processor");
+    submit_direct_command(CMD_COMMAND_STOP);
+    
     /* Direct LED control test for verification */
     k_sleep(K_SECONDS(2));
     LOG_INF("Direct LED control test - ON");
@@ -449,6 +626,9 @@ int main(void)
     k_sleep(K_SECONDS(2));
     LOG_INF("Direct LED control test - OFF");
     led_off();
+    
+    /* Wait for everything to initialize */
+    k_sleep(K_SECONDS(2));
     
     /* Enhanced heartbeat in main thread with time data display */
     while (1) {
@@ -499,6 +679,26 @@ int main(void)
         } else {
             LOG_INF("Heartbeat - No user role set");
         }
+        
+        /* Periodically display CPR session state - only log every 5 seconds to reduce noise */
+        static uint32_t last_cpr_log_time = 0;
+        uint32_t now = k_uptime_get_32();
+        if (now - last_cpr_log_time >= 5000) {
+            last_cpr_log_time = now;
+            
+            if (cpr_session_active) {
+                /* Get current CPR session time and display it */
+                uint32_t elapsed_sec = get_cpr_session_time();
+                uint32_t minutes = elapsed_sec / 60;
+                uint32_t seconds = elapsed_sec % 60;
+                    
+                LOG_INF("****** CPR SESSION ACTIVE - %02d:%02d elapsed ******", minutes, seconds);
+            } else {
+                LOG_INF("------ No CPR session active ------");
+            }
+        }
+        
+        /* No automatic CPR session start/stop - controlled only by commands */
         
         /* Make sure we can receive instructor ID commands */
         static bool sent_id = false;

@@ -47,6 +47,10 @@ static k_tid_t processor_tid;
 extern bool led_request_pending;
 extern bool led_requested_state;
 
+/* External references to CPR session functions in main.c */
+extern void start_cpr_session(void);
+extern void stop_cpr_session(void);
+
 /**
  * Thread function for asynchronous command processing
  */
@@ -301,11 +305,13 @@ static int process_direct_command(uint8_t cmd_byte)
             
         case CMD_CONTROL_START:
             LOG_INF("Command: Start CPR");
+            start_cpr_session();
             request_led_state(true);
             break;
             
         case CMD_COMMAND_STOP:
             LOG_INF("Command: Stop CPR");
+            stop_cpr_session();
             request_led_state(false);
             break;
             
@@ -368,10 +374,14 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
     else if (command == CMD_CONTROL_START) {
         LOG_INF("Command: Start CPR");
         request_led_state(true);
+        LOG_INF("Calling start_cpr_session() from message_processor_simple");
+        start_cpr_session();  /* Call CPR session start function */
     }
     else if (command == CMD_COMMAND_STOP) {
         LOG_INF("Command: Stop CPR");
         request_led_state(false);
+        LOG_INF("Calling stop_cpr_session() from message_processor_simple");
+        stop_cpr_session();   /* Call CPR session stop function */
     }
     else if (command == CMD_COMMAND_DATA) {
         LOG_INF("Command: Received CPR Init Data");

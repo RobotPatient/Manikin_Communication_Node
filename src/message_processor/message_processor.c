@@ -24,6 +24,10 @@ static uint8_t current_user_role = USER_ROLE_NONE;
 static char time_data[18];
 static bool has_time_data = false;
 
+/* Forward declarations for CPR session management functions in main.c */
+extern void start_cpr_session(void);
+extern void stop_cpr_session(void);
+
 /* Message queue for asynchronous processing */
 K_MSGQ_DEFINE(command_msgq, MSG_BUFFER_SIZE, MSG_QUEUE_SIZE, 4);
 
@@ -348,11 +352,15 @@ static int process_direct_command(uint8_t cmd_byte)
         case CMD_CONTROL_START:
             LOG_INF("Command: Start CPR");
             request_led_state(true);
+            LOG_INF("Calling start_cpr_session() function");
+            start_cpr_session();  /* Start CPR session timing */
+            LOG_INF("CPR session should now be active");
             break;
             
         case CMD_COMMAND_STOP:
             LOG_INF("Command: Stop CPR");
             request_led_state(false);
+            stop_cpr_session();   /* Stop CPR session timing */
             break;
             
         default:
@@ -482,10 +490,12 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
             else if (command == CMD_CONTROL_START) {
                 LOG_INF("Command: Start CPR");
                 request_led_state(true);
+                start_cpr_session();  /* Start CPR session timing */
             }
             else if (command == CMD_COMMAND_STOP) {
                 LOG_INF("Command: Stop CPR");
                 request_led_state(false);
+                stop_cpr_session();   /* Stop CPR session timing */
             }
             else if (command == CMD_COMMAND_DATA) {
                 LOG_INF("Command: Received CPR Init Data");
@@ -605,6 +615,8 @@ bool has_received_time_data(void)
 {
     return has_time_data;
 }
+
+/* Function removed - implemented in main.c */
 
 /**
  * @brief Get the current time from the RTC
