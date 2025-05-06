@@ -69,7 +69,9 @@ void start_cpr_session(void)
     cpr_session_start_time = k_uptime_get_32();
     LOG_INF("CPR session started - timer initialized at %u", cpr_session_start_time);
     
-    /* We'll handle BLE notifications in the main loop and led_timer_handler */
+    /* We'll send notification from the timer handler after detecting state change */
+    /* This is safer because the timer handler has context to access BLE services */
+    LOG_INF("CPR session start: Notification will be sent via timer handler");
 }
 
 /* Function to handle CPR session stop */
@@ -83,6 +85,10 @@ void stop_cpr_session(void)
     
     if (!cpr_session_active) {
         LOG_INF("CPR session already inactive - nothing to stop");
+        
+        /* We'll send notification from the timer handler after detecting state change */
+        LOG_INF("CPR session stop: Already inactive - notification will be sent via timer handler");
+        
         return;
     }
     
@@ -103,7 +109,8 @@ void stop_cpr_session(void)
     cpr_session_active = false;
     cpr_session_start_time = 0;
     
-    /* We'll handle BLE notifications in the main loop and led_timer_handler */
+    /* Store elapsed time for notification via timer handler */
+    LOG_INF("CPR session stop: Notification with duration %u seconds will be sent via timer handler", elapsed_sec);
 }
 
 /* Function to get current CPR session elapsed time in seconds */
@@ -232,10 +239,7 @@ BT_GATT_SERVICE_DEFINE(custom_svc,
     BT_GATT_CCC(notify_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
 
-/* Define simplest valid advertising data */
-static const struct bt_data ad[] = {
-    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-};
+/* Note: Using minimal advertising data directly in the advertising function */
 
 /* Work queue item for delayed advertising */
 static struct k_work_delayable adv_work;
@@ -423,8 +427,8 @@ static void led_timer_handler(struct k_timer *timer)
             
             /* If notifications are enabled, send CPR session time */
             if (notify_enabled) {
-                /* Format: [TYPE=0x30][ELAPSED_SEC] */
-                notify_buffer[0] = 0x30;  /* Message type: CPR Session Time */
+                /* Format: [TYPE][ELAPSED_SEC] */
+                notify_buffer[0] = NOTIFY_TYPE_CPR_TIME;  /* Message type: CPR Session Time */
                 notify_buffer[1] = (elapsed_seconds >> 24) & 0xFF;
                 notify_buffer[2] = (elapsed_seconds >> 16) & 0xFF;
                 notify_buffer[3] = (elapsed_seconds >> 8) & 0xFF;
@@ -440,44 +444,104 @@ static void led_timer_handler(struct k_timer *timer)
         }
     }
     
-    /* Handle CPR session state change notifications */
-    static bool notified_cpr_state = false;
+    /* Track CPR session state changes and command acknowledgments */
+    static bool last_notified_state = false;
+    static bool start_ack_sent = false;
+    static bool stop_ack_sent = false;
+    static uint32_t session_stop_time = 0;
     
-    /* Only send notification when state changes */
-    if (notified_cpr_state != cpr_session_active) {
+    /* Handle CPR state changes first */
+    if (last_notified_state != cpr_session_active) {
         LOG_INF("CPR session state changed for notification: %d -> %d", 
-                notified_cpr_state, cpr_session_active);
+                last_notified_state, cpr_session_active);
         
-        /* Send notification only if BLE notifications are enabled */
+        /* Update state tracking */
+        if (cpr_session_active && !last_notified_state) {
+            /* Session just activated - reset acknowledgment flags */
+            start_ack_sent = false;
+            stop_ack_sent = true;  /* Don't send stop ack yet */
+        } 
+        else if (!cpr_session_active && last_notified_state) {
+            /* Session just stopped - record stop time for stop ack */
+            session_stop_time = now;
+            start_ack_sent = true;  /* Don't send start ack anymore */
+            stop_ack_sent = false;  /* Need to send stop ack */
+        }
+        
+        /* Send state change notification */
         if (notify_enabled) {
             if (cpr_session_active) {
-                /* Format: [TYPE=0x40][STATE=0x01] */
-                notify_buffer[0] = 0x40;  /* Message type: CPR Session State */
+                /* Format: [TYPE][STATE=0x01] */
+                notify_buffer[0] = NOTIFY_TYPE_CPR_STATE;  /* Message type: CPR Session State */
                 notify_buffer[1] = 0x01;  /* State: Active */
                 
                 int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 2);
                 if (err) {
-                    LOG_ERR("CPR session start notification failed (err %d)", err);
+                    LOG_ERR("CPR session state notification failed (err %d)", err);
                 } else {
-                    LOG_INF("CPR session start notification sent successfully");
-                    notified_cpr_state = cpr_session_active;  /* Update notified state only after successful notification */
+                    LOG_INF("CPR session ACTIVE state notification sent successfully");
+                    last_notified_state = cpr_session_active;  /* Update notified state */
                 }
             } else {
-                /* Format: [TYPE=0x40][STATE=0x00] */
-                notify_buffer[0] = 0x40;  /* Message type: CPR Session State */
+                /* Format: [TYPE][STATE=0x00] */
+                notify_buffer[0] = NOTIFY_TYPE_CPR_STATE;  /* Message type: CPR Session State */
                 notify_buffer[1] = 0x00;  /* State: Inactive */
                 
                 int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 2);
                 if (err) {
-                    LOG_ERR("CPR session stop notification failed (err %d)", err);
+                    LOG_ERR("CPR session state notification failed (err %d)", err);
                 } else {
-                    LOG_INF("CPR session stop notification sent successfully");
-                    notified_cpr_state = cpr_session_active;  /* Update notified state only after successful notification */
+                    LOG_INF("CPR session INACTIVE state notification sent successfully");
+                    last_notified_state = cpr_session_active;  /* Update notified state */
                 }
             }
         } else {
-            LOG_INF("BLE notifications not enabled, no CPR state notification sent");
-            notified_cpr_state = cpr_session_active;  /* Update even if no notification is sent */
+            LOG_INF("BLE notifications not enabled, no state notification sent");
+            last_notified_state = cpr_session_active;  /* Update even if no notification is sent */
+        }
+    }
+    
+    /* Now handle command acknowledgments */
+    if (notify_enabled) {
+        /* Send start acknowledgment when first starting */
+        if (cpr_session_active && !start_ack_sent) {
+            /* Format: [TYPE][CMD][STATUS] */
+            notify_buffer[0] = NOTIFY_TYPE_CPR_CMD_ACK;  /* Message type: CPR Command ACK */
+            notify_buffer[1] = CPR_CMD_START;            /* Command: Start CPR */
+            notify_buffer[2] = STATUS_OK;                /* Status: OK */
+            
+            int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 3);
+            if (err) {
+                LOG_ERR("CPR start acknowledgment failed (err %d)", err);
+            } else {
+                LOG_INF("CPR START command acknowledgment sent: OK");
+                start_ack_sent = true;
+            }
+        }
+        
+        /* Send stop acknowledgment when stopped */
+        if (!cpr_session_active && !stop_ack_sent) {
+            /* Calculate session duration if we have valid times */
+            uint32_t elapsed_sec = 0;
+            if (session_stop_time > cpr_session_start_time && cpr_session_start_time > 0) {
+                uint32_t elapsed_ms = session_stop_time - cpr_session_start_time;
+                elapsed_sec = elapsed_ms / 1000;
+            }
+            
+            /* Format: [TYPE][CMD][STATUS][DUR_HI][DUR_LO] */
+            notify_buffer[0] = NOTIFY_TYPE_CPR_CMD_ACK;     /* Message type: CPR Command ACK */
+            notify_buffer[1] = CPR_CMD_STOP;                /* Command: Stop CPR */
+            notify_buffer[2] = STATUS_OK;                   /* Status: OK */
+            notify_buffer[3] = (elapsed_sec >> 8) & 0xFF;   /* Duration high byte */
+            notify_buffer[4] = elapsed_sec & 0xFF;          /* Duration low byte */
+            
+            int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 5);
+            if (err) {
+                LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
+            } else {
+                LOG_INF("CPR STOP command acknowledgment sent: OK with duration %u seconds", elapsed_sec);
+                stop_ack_sent = true;
+            }
         }
     }
     

@@ -40,6 +40,21 @@
 #define CMD_CPR_START               0x50
 #define CMD_CPR_STOP                0x51
 
+/* BLE notification message types */
+#define NOTIFY_TYPE_LED_STATE       0x10    /* LED state notification */
+#define NOTIFY_TYPE_TIME_DATA       0x20    /* Time data notification */
+#define NOTIFY_TYPE_CPR_TIME        0x30    /* CPR session time progress notification */
+#define NOTIFY_TYPE_CPR_STATE       0x40    /* CPR session state change notification */
+#define NOTIFY_TYPE_CPR_CMD_ACK     0x60    /* CPR command acknowledgment */
+
+/* CPR command IDs for acknowledgments */
+#define CPR_CMD_START               0x01    /* Start CPR command */
+#define CPR_CMD_STOP                0x02    /* Stop CPR command */
+
+/* Status codes for acknowledgments */
+#define STATUS_OK                   0x00    /* Command executed successfully */
+#define STATUS_ERROR                0x01    /* Command execution failed */
+
 /* Forward declarations for external CPR functions */
 extern bool is_cpr_session_active(void);
 extern void start_cpr_session(void);
