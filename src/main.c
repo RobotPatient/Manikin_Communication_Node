@@ -162,7 +162,7 @@ static void start_adv_with_delay(void)
     
     /* Define the most minimal advertising parameters possible */
     static const struct bt_le_adv_param param = {
-        .options = BT_LE_ADV_OPT_CONNECTABLE,  /* Use the simpler connectable flag */
+        .options = BT_LE_ADV_OPT_CONN,  /* Use the simpler connectable flag */
         .interval_min = BT_GAP_ADV_SLOW_INT_MIN,  /* Use slower interval for stability */
         .interval_max = BT_GAP_ADV_SLOW_INT_MAX,
         .id = BT_ID_DEFAULT,
