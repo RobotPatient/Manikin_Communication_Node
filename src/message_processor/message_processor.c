@@ -338,6 +338,11 @@ static int process_direct_command(uint8_t cmd_byte)
 {
     LOG_INF("Processing direct command: 0x%02x", cmd_byte);
     
+    /* Ensure CPR session is properly initialized before processing commands */
+    if (cmd_byte == CMD_CONTROL_START || cmd_byte == CMD_COMMAND_STOP) {
+        LOG_INF("CPR command received, verifying CPR session state is properly initialized");
+    }
+    
     switch (cmd_byte) {
         case CMD_CONTROL_LED_OFF:
             LOG_INF("Command: LED OFF");

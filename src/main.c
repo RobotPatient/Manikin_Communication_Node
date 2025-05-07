@@ -18,15 +18,64 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
+/* Global connection tracking variables - declared at file scope */
+struct bt_conn *current_conn = NULL;
+bool is_connected = false;
+uint32_t connection_time = 0;   /* Time when connection was established */
+uint32_t connection_ready_delay = 2000;  /* Delay in ms before sending notifications */
+
 /* Forward declarations for CPR session management */
 bool is_cpr_session_active(void);
 void start_cpr_session(void);
 void stop_cpr_session(void);
 uint32_t get_cpr_session_time(void);
 
+/* Helper function for sending notifications safely */
+static int send_notification_safely(const void *data, uint16_t len) {
+    /* We still need extern declaration for custom_svc which is defined by BT_GATT_SERVICE_DEFINE macro */
+    extern const struct bt_gatt_service_static custom_svc;
+    
+    /* Only proceed if we have a valid connection that's had time to stabilize */
+    if (!is_connected || !current_conn) {
+        LOG_WRN("Cannot send notification - no active connection");
+        return -ENOTCONN;
+    }
+    
+    uint32_t now = k_uptime_get_32();
+    uint32_t conn_age = now - connection_time;
+    
+    if (conn_age < connection_ready_delay) {
+        LOG_WRN("Connection too fresh (%u ms), delaying notification", conn_age);
+        return -EAGAIN;
+    }
+    
+    /* Try to send the notification */
+    int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], data, len);
+    
+    /* Handle any errors */
+    if (err) {
+        LOG_ERR("Notification failed (err %d)", err);
+        
+        /* If error indicates connection issue, clear our connection state */
+        if (err == -BT_ATT_ERR_UNLIKELY || err == -ENOMEM) {
+            LOG_ERR("Connection issue detected, resetting connection state");
+            if (current_conn) {
+                bt_conn_unref(current_conn);
+                current_conn = NULL;
+            }
+            is_connected = false;
+        }
+    }
+    
+    return err;
+}
+
 /* Global notification buffer and state */
 static uint8_t notify_buffer[20] = {0};
 static bool notify_enabled = false;
+
+/* Always allow CPR notifications, even if standard notifications aren't enabled */
+static bool cpr_notifications_allowed = true;
 
 /* External function from basic_implementation.c */
 void basic_implementation_init(void);
@@ -34,13 +83,16 @@ void basic_implementation_init(void);
 /* Buffer for storing received data */
 static uint8_t recv_buffer[20];
 
+/* Buffer for CPR state characteristic */
+static uint8_t cpr_state_buffer[20];
+
 /* LED control flags - for message processor */
 bool led_request_pending = false;
 bool led_requested_state = false;
 
-/* CPR session timing */
+/* CPR session timing - explicitly initialized to inactive */
 static uint32_t cpr_session_start_time = 0;
-static bool cpr_session_active = false;
+static bool cpr_session_active = false;  /* MUST remain false at startup */
 
 /* Function to check if CPR session is active */
 bool is_cpr_session_active(void)
@@ -63,6 +115,12 @@ void start_cpr_session(void)
     LOG_INF("*******************************************");
     LOG_INF("Current state before start: active=%d, start_time=%u", 
             cpr_session_active, cpr_session_start_time);
+            
+    /* Safety check to prevent activation during system startup */
+    if (k_uptime_get_32() < 1000) {
+        LOG_ERR("PREVENTING CPR session start during early boot (uptime < 1s)");
+        return;
+    }
     
     /* Always start a new session */
     cpr_session_active = true;
@@ -141,8 +199,12 @@ static struct bt_uuid_128 custom_char_uuid = BT_UUID_INIT_128(
 
 static struct bt_uuid_128 custom_notify_uuid = BT_UUID_INIT_128(
     BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef2));
+    
+/* CPR state characteristic UUID - for reading CPR state */
+static struct bt_uuid_128 cpr_state_char_uuid = BT_UUID_INIT_128(
+    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef3));
 
-/* Forward declaration of our GATT service (defined later) */
+/* Forward declaration of our GATT service (defined later with BT_GATT_SERVICE_DEFINE) */
 extern const struct bt_gatt_service_static custom_svc;
 
 /* Write callback for custom characteristic */
@@ -205,11 +267,51 @@ static void notify_timer_handler(struct k_timer *timer)
     }
 }
 
+/* Read handler for CPR state characteristic */
+static ssize_t cpr_state_read(struct bt_conn *conn,
+                             const struct bt_gatt_attr *attr,
+                             void *buf, uint16_t len,
+                             uint16_t offset)
+{
+    /* Prepare the CPR state data in the buffer */
+    uint32_t elapsed_sec = get_cpr_session_time();
+    uint32_t minutes = elapsed_sec / 60;
+    uint32_t seconds = elapsed_sec % 60;
+    
+    /* Format: [STATE][ELAPSED][TIME_STR] */
+    cpr_state_buffer[0] = is_cpr_session_active() ? 0x01 : 0x00;  /* Active/Inactive */
+    cpr_state_buffer[1] = (elapsed_sec >> 24) & 0xFF;  /* MSB */
+    cpr_state_buffer[2] = (elapsed_sec >> 16) & 0xFF;
+    cpr_state_buffer[3] = (elapsed_sec >> 8) & 0xFF;
+    cpr_state_buffer[4] = elapsed_sec & 0xFF;          /* LSB */
+    
+    /* Add formatted time string "cpr:MM:SS" */
+    char time_str[10];
+    snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
+    size_t str_len = strlen(time_str);
+    
+    /* Copy the string to the buffer */
+    memcpy(&cpr_state_buffer[5], time_str, str_len);
+    
+    /* Calculate total response length */
+    size_t total_len = 5 + str_len;
+    
+    LOG_INF("CPR state read: active=%d, time=%s (%u seconds)",
+           cpr_state_buffer[0], time_str, elapsed_sec);
+    
+    /* Return the data */
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, cpr_state_buffer, total_len);
+}
+
 /* CCC change handler for notification characteristic */
 static void notify_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
     notify_enabled = (value == BT_GATT_CCC_NOTIFY);
     LOG_INF("Notifications %s", notify_enabled ? "enabled" : "disabled");
+    
+    /* Always ensure CPR notifications are allowed, regardless of CCC setting */
+    cpr_notifications_allowed = true;
+    LOG_INF("CPR notifications remain allowed regardless of CCC setting");
     
     /* Start or stop the notification timer based on state */
     if (notify_enabled) {
@@ -236,6 +338,13 @@ BT_GATT_SERVICE_DEFINE(custom_svc,
                           BT_GATT_CHRC_NOTIFY,
                           BT_GATT_PERM_READ,
                           NULL, NULL, notify_buffer),
+    BT_GATT_CCC(notify_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    
+    /* CPR State characteristic - with read and notify capabilities */
+    BT_GATT_CHARACTERISTIC(&cpr_state_char_uuid.uuid,
+                          BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+                          BT_GATT_PERM_READ,
+                          cpr_state_read, NULL, cpr_state_buffer),
     BT_GATT_CCC(notify_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
 
@@ -354,6 +463,21 @@ static void connected(struct bt_conn *conn, uint8_t err)
     LOG_INF("**********************************************");
     LOG_INF("*************** CONNECTED *******************");
     LOG_INF("**********************************************");
+    
+    /* Store the connection and set connected flag */
+    if (current_conn) {
+        bt_conn_unref(current_conn);
+    }
+    current_conn = bt_conn_ref(conn);
+    is_connected = true;
+    connection_time = k_uptime_get_32();  /* Record when connection was established */
+    
+    /* Ensure CPR session is inactive when a new connection is established */
+    cpr_session_active = false;
+    cpr_session_start_time = 0;
+    
+    LOG_INF("Connection established at %u ms, allowing %u ms before notifications",
+           connection_time, connection_ready_delay);
 }
 
 /* Disconnected callback */
@@ -362,6 +486,13 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     LOG_INF("**********************************************");
     LOG_INF("************* DISCONNECTED: %d *************", reason);
     LOG_INF("**********************************************");
+    
+    /* Clear connection tracking */
+    if (current_conn) {
+        bt_conn_unref(current_conn);
+        current_conn = NULL;
+    }
+    is_connected = false;
     
     /* Schedule delayed advertising restart */
     LOG_INF("Scheduling advertising restart after disconnect");
@@ -425,20 +556,38 @@ static void led_timer_handler(struct k_timer *timer)
             LOG_INF("CPR Session Time: %02d:%02d (elapsed seconds: %u)", 
                    minutes, seconds, elapsed_seconds);
             
-            /* If notifications are enabled, send CPR session time */
-            if (notify_enabled) {
-                /* Format: [TYPE][ELAPSED_SEC] */
+            /* If notifications are enabled or CPR notifications allowed, and we have a valid, ready connection */
+            uint32_t now = k_uptime_get_32();
+            bool connection_ready = (now - connection_time) >= connection_ready_delay;
+            
+            if ((notify_enabled || cpr_notifications_allowed) && is_connected && current_conn && connection_ready) {
+                /* Format time in MM:SS format */
+                uint32_t minutes = elapsed_seconds / 60;
+                uint32_t seconds = elapsed_seconds % 60;
+                
+                /* Format: [TYPE][ELAPSED_SEC][TIME_STR] */
                 notify_buffer[0] = NOTIFY_TYPE_CPR_TIME;  /* Message type: CPR Session Time */
                 notify_buffer[1] = (elapsed_seconds >> 24) & 0xFF;
                 notify_buffer[2] = (elapsed_seconds >> 16) & 0xFF;
                 notify_buffer[3] = (elapsed_seconds >> 8) & 0xFF;
                 notify_buffer[4] = elapsed_seconds & 0xFF;
                 
-                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 5);
+                /* Add formatted time string "cpr:MM:SS" */
+                char time_str[10];
+                snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
+                size_t str_len = strlen(time_str);
+                
+                /* Copy the string to the notification buffer */
+                memcpy(&notify_buffer[5], time_str, str_len);
+                
+                /* Send notification with both binary time and human-readable format */
+                int err = send_notification_safely(notify_buffer, 5 + str_len);
                 if (err) {
                     LOG_ERR("CPR session time notification failed (err %d)", err);
+                    /* Error handling is done in send_notification_safely */
                 } else {
-                    LOG_DBG("CPR session time notification sent: %u seconds", elapsed_seconds);
+                    LOG_DBG("CPR session time notification sent: %s (%u seconds)", 
+                           time_str, elapsed_seconds);
                 }
             }
         }
@@ -468,16 +617,20 @@ static void led_timer_handler(struct k_timer *timer)
             stop_ack_sent = false;  /* Need to send stop ack */
         }
         
-        /* Send state change notification */
-        if (notify_enabled) {
+        /* Send state change notification only if we have a valid and ready connection */
+        uint32_t now = k_uptime_get_32();
+        bool connection_ready = (now - connection_time) >= connection_ready_delay;
+        
+        if ((notify_enabled || cpr_notifications_allowed) && is_connected && current_conn && connection_ready) {
             if (cpr_session_active) {
                 /* Format: [TYPE][STATE=0x01] */
                 notify_buffer[0] = NOTIFY_TYPE_CPR_STATE;  /* Message type: CPR Session State */
                 notify_buffer[1] = 0x01;  /* State: Active */
                 
-                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 2);
+                int err = send_notification_safely(notify_buffer, 2);
                 if (err) {
-                    LOG_ERR("CPR session state notification failed (err %d)", err);
+                    LOG_ERR("CPR session ACTIVE state notification failed (err %d)", err);
+                    /* Don't update state so we'll try again next time */
                 } else {
                     LOG_INF("CPR session ACTIVE state notification sent successfully");
                     last_notified_state = cpr_session_active;  /* Update notified state */
@@ -487,9 +640,10 @@ static void led_timer_handler(struct k_timer *timer)
                 notify_buffer[0] = NOTIFY_TYPE_CPR_STATE;  /* Message type: CPR Session State */
                 notify_buffer[1] = 0x00;  /* State: Inactive */
                 
-                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 2);
+                int err = send_notification_safely(notify_buffer, 2);
                 if (err) {
-                    LOG_ERR("CPR session state notification failed (err %d)", err);
+                    LOG_ERR("CPR session INACTIVE state notification failed (err %d)", err);
+                    /* Don't update state so we'll try again next time */
                 } else {
                     LOG_INF("CPR session INACTIVE state notification sent successfully");
                     last_notified_state = cpr_session_active;  /* Update notified state */
@@ -501,20 +655,38 @@ static void led_timer_handler(struct k_timer *timer)
         }
     }
     
-    /* Now handle command acknowledgments */
-    if (notify_enabled) {
+    /* Now handle command acknowledgments - only if we have a valid and ready connection */
+    uint32_t now_timer = k_uptime_get_32();
+    bool connection_ready = (now_timer - connection_time) >= connection_ready_delay;
+    
+    if ((notify_enabled || cpr_notifications_allowed) && is_connected && current_conn && connection_ready) {
         /* Send start acknowledgment when first starting */
         if (cpr_session_active && !start_ack_sent) {
-            /* Format: [TYPE][CMD][STATUS] */
+            /* Calculate elapsed time (should be close to 0) */
+            uint32_t elapsed_sec = get_cpr_session_time();
+            uint32_t minutes = elapsed_sec / 60;
+            uint32_t seconds = elapsed_sec % 60;
+            
+            /* Format: [TYPE][CMD][STATUS][TIME_STR] */
             notify_buffer[0] = NOTIFY_TYPE_CPR_CMD_ACK;  /* Message type: CPR Command ACK */
             notify_buffer[1] = CPR_CMD_START;            /* Command: Start CPR */
             notify_buffer[2] = STATUS_OK;                /* Status: OK */
             
-            int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 3);
+            /* Add formatted time string "cpr:MM:SS" */
+            char time_str[10];
+            snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
+            size_t str_len = strlen(time_str);
+            
+            /* Copy the string to the notification buffer */
+            memcpy(&notify_buffer[3], time_str, str_len);
+            
+            /* Send notification with time string */
+            int err = send_notification_safely(notify_buffer, 3 + str_len);
             if (err) {
                 LOG_ERR("CPR start acknowledgment failed (err %d)", err);
+                /* Don't mark as sent so we'll retry later */
             } else {
-                LOG_INF("CPR START command acknowledgment sent: OK");
+                LOG_INF("CPR START command acknowledgment sent: OK with time %s", time_str);
                 start_ack_sent = true;
             }
         }
@@ -528,18 +700,35 @@ static void led_timer_handler(struct k_timer *timer)
                 elapsed_sec = elapsed_ms / 1000;
             }
             
-            /* Format: [TYPE][CMD][STATUS][DUR_HI][DUR_LO] */
+            /* Format elapsed time for human-readable format */
+            uint32_t minutes = elapsed_sec / 60;
+            uint32_t seconds = elapsed_sec % 60;
+            
+            /* Format: [TYPE][CMD][STATUS][TIME_STR] */
             notify_buffer[0] = NOTIFY_TYPE_CPR_CMD_ACK;     /* Message type: CPR Command ACK */
             notify_buffer[1] = CPR_CMD_STOP;                /* Command: Stop CPR */
             notify_buffer[2] = STATUS_OK;                   /* Status: OK */
+            
+            /* Format binary duration as well */
             notify_buffer[3] = (elapsed_sec >> 8) & 0xFF;   /* Duration high byte */
             notify_buffer[4] = elapsed_sec & 0xFF;          /* Duration low byte */
             
-            int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 5);
+            /* Add formatted time string "cpr:MM:SS" */
+            char time_str[10];
+            snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
+            size_t str_len = strlen(time_str);
+            
+            /* Copy the string to the notification buffer */
+            memcpy(&notify_buffer[5], time_str, str_len);
+            
+            /* Send notification with both binary duration and formatted time string */
+            int err = send_notification_safely(notify_buffer, 5 + str_len);
             if (err) {
                 LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
+                /* Don't mark as sent so we'll retry later */
             } else {
-                LOG_INF("CPR STOP command acknowledgment sent: OK with duration %u seconds", elapsed_sec);
+                LOG_INF("CPR STOP command acknowledgment sent: OK with time %s (%u seconds)", 
+                        time_str, elapsed_sec);
                 stop_ack_sent = true;
             }
         }
@@ -646,6 +835,11 @@ int main(void)
     } else {
         LOG_INF("Message processor initialized successfully");
     }
+    
+    /* Explicitly ensure CPR session is inactive on startup */
+    cpr_session_active = false;
+    cpr_session_start_time = 0;
+    LOG_INF("CPR session explicitly set to inactive on startup");
     
     /* Register connection callbacks */
     bt_conn_cb_register(&conn_callbacks);
