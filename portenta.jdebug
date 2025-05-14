@@ -33,7 +33,8 @@ void OnProjectLoad (void) {
   // User settings
   //
   Edit.SysVar (VAR_RTT_ENABLED, 1);
-  File.Open ("$(ProjectDir)/build/zephyr/zephyr.elf");
+  //File.Open ("$(ProjectDir)/build/zephyr/zephyr.elf");
+  File.Open ("$(ProjectDir)/build/manikin_mainboard_portenta/stm32h747xx/m7/zephyr/zephyr.elf");
   // build/manikin_mainboard_portenta/stm32h747xx/m7/zephyr/zephyr.elf");
 }
 //void BeforeTargetConnect (void) {

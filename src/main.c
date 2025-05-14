@@ -10,6 +10,7 @@
 #include <zephyr/drivers/gpio.h>
 #include "message_processor/message_processor.h"
 #include "ble/led_svc.h"
+#include "ble_notifications.h"
 
 
 /* Include message processing commands */
@@ -24,15 +25,56 @@ bool is_connected = false;
 uint32_t connection_time = 0;   /* Time when connection was established */
 uint32_t connection_ready_delay = 2000;  /* Delay in ms before sending notifications */
 
+/* Global notification buffer and state */
+static uint8_t notify_buffer[20] = {0};
+
 /* Forward declarations for CPR session management */
 bool is_cpr_session_active(void);
 void start_cpr_session(void);
 void stop_cpr_session(void);
 uint32_t get_cpr_session_time(void);
 
-/* Helper function for sending notifications safely */
+/* Forward declaration of our notification helper functions */
+static int send_notification_safely(const void *data, uint16_t len);
+
+/* Helper function to prepare and send a notification
+ * 
+ * This function handles:
+ * 1. Adding the command start byte
+ * 2. Adding the message type
+ * 3. Adding payload data
+ * 4. Safely sending the notification with connection checks
+ *
+ * Usage:
+ * - For simple notifications with a single value:
+ *   send_ble_notification(MSG_TYPE_X, &value, sizeof(value));
+ *
+ * - For notifications with multiple fields, create the payload first, then call:
+ *   send_ble_notification(MSG_TYPE_X, payload, payload_size);
+ */
+static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t payload_len) {
+    /* Check if we have space in buffer */
+    if (payload_len + 2 > sizeof(notify_buffer)) {
+        LOG_ERR("Notification payload too large: %d bytes", payload_len);
+        return -EINVAL;
+    }
+    
+    /* Format the notification with start byte and message type */
+    notify_buffer[0] = BLE_COMMAND_BYTE_START;  /* Start byte */
+    notify_buffer[1] = msg_type;                /* Message type */
+    
+    /* Add payload data if provided */
+    if (payload != NULL && payload_len > 0) {
+        memcpy(&notify_buffer[2], payload, payload_len);
+    }
+    
+    /* Send notification */
+    return send_notification_safely(notify_buffer, payload_len + 2);
+}
+
+/* Helper function for checking connection and sending notifications */
 static int send_notification_safely(const void *data, uint16_t len) {
-    /* We still need extern declaration for custom_svc which is defined by BT_GATT_SERVICE_DEFINE macro */
+    /* We need extern declaration for custom_svc which is defined by BT_GATT_SERVICE_DEFINE macro */
     extern const struct bt_gatt_service_static custom_svc;
     
     /* Only proceed if we have a valid connection that's had time to stabilize */
@@ -70,8 +112,7 @@ static int send_notification_safely(const void *data, uint16_t len) {
     return err;
 }
 
-/* Global notification buffer and state */
-static uint8_t notify_buffer[20] = {0};
+/* Constants moved to ble_notifications.h */
 static bool notify_enabled = false;
 
 /* Always allow CPR notifications, even if standard notifications aren't enabled */
@@ -233,12 +274,10 @@ static ssize_t custom_char_write(struct bt_conn *conn,
         LOG_INF("Command submitted to message processor successfully");
     }
 
-    /* Copy same data to notify buffer to demonstrate notifications */
+    /* Notify clients of received data using the helper function */
     if (notify_enabled && len <= sizeof(notify_buffer)) {
-        memcpy(notify_buffer, buf, len);
-        
-        /* Send notification with received data */
-        int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, len);
+        /* Echo back data with standard message format using helper function */
+        int err = send_ble_notification(NOTIFY_TYPE_HEARTBEAT, buf, len);
         if (err) {
             LOG_ERR("Notification failed (err %d)", err);
         } else {
@@ -249,16 +288,17 @@ static ssize_t custom_char_write(struct bt_conn *conn,
     return len;
 }
 
+/* Message types are defined in ble_notifications.h */
+
 /* Notification timer callback */
 static void notify_timer_handler(struct k_timer *timer)
 {
     if (notify_enabled) {
         /* Update the notification data with a counter */
         notify_count++;
-        notify_buffer[0] = notify_count;
         
-        /* Send notification */
-        int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 1);
+        /* Send heartbeat notification */
+        int err = send_ble_notification(NOTIFY_TYPE_HEARTBEAT, &notify_count, sizeof(notify_count));
         if (err) {
             LOG_ERR("Periodic notification failed (err %d)", err);
         } else {
@@ -528,12 +568,11 @@ static void led_timer_handler(struct k_timer *timer)
         
         LOG_INF("LED is now %s", led_requested_state ? "ON" : "OFF");
         
-        /* Update our notification data to reflect LED state */
-        notify_buffer[0] = led_requested_state ? 0x01 : 0x00;
-        
         /* Send a notification if notifications are enabled */
         if (notify_enabled) {
-            int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 1);
+            uint8_t led_state = led_requested_state ? 0x01 : 0x00;
+            
+            int err = send_ble_notification(NOTIFY_TYPE_LED_STATE, &led_state, sizeof(led_state));
             if (err) {
                 LOG_ERR("LED state notification failed (err %d)", err);
             } else {
@@ -565,23 +604,25 @@ static void led_timer_handler(struct k_timer *timer)
                 uint32_t minutes = elapsed_seconds / 60;
                 uint32_t seconds = elapsed_seconds % 60;
                 
-                /* Format: [TYPE][ELAPSED_SEC][TIME_STR] */
-                notify_buffer[0] = NOTIFY_TYPE_CPR_TIME;  /* Message type: CPR Session Time */
-                notify_buffer[1] = (elapsed_seconds >> 24) & 0xFF;
-                notify_buffer[2] = (elapsed_seconds >> 16) & 0xFF;
-                notify_buffer[3] = (elapsed_seconds >> 8) & 0xFF;
-                notify_buffer[4] = elapsed_seconds & 0xFF;
+                /* Create a payload with [ELAPSED_SEC][TIME_STR] */
+                uint8_t payload[16]; /* Big enough for 4 bytes elapsed time + string */
+                
+                /* Add elapsed time as 32-bit value */
+                payload[0] = (elapsed_seconds >> 24) & 0xFF;
+                payload[1] = (elapsed_seconds >> 16) & 0xFF;
+                payload[2] = (elapsed_seconds >> 8) & 0xFF;
+                payload[3] = elapsed_seconds & 0xFF;
                 
                 /* Add formatted time string "cpr:MM:SS" */
                 char time_str[10];
                 snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
                 size_t str_len = strlen(time_str);
                 
-                /* Copy the string to the notification buffer */
-                memcpy(&notify_buffer[5], time_str, str_len);
+                /* Copy the string to the payload */
+                memcpy(&payload[4], time_str, str_len);
                 
                 /* Send notification with both binary time and human-readable format */
-                int err = send_notification_safely(notify_buffer, 5 + str_len);
+                int err = send_ble_notification(NOTIFY_TYPE_CPR_TIME, payload, 4 + str_len);
                 if (err) {
                     LOG_ERR("CPR session time notification failed (err %d)", err);
                     /* Error handling is done in send_notification_safely */
@@ -623,11 +664,10 @@ static void led_timer_handler(struct k_timer *timer)
         
         if ((notify_enabled || cpr_notifications_allowed) && is_connected && current_conn && connection_ready) {
             if (cpr_session_active) {
-                /* Format: [TYPE][STATE=0x01] */
-                notify_buffer[0] = NOTIFY_TYPE_CPR_STATE;  /* Message type: CPR Session State */
-                notify_buffer[1] = 0x01;  /* State: Active */
+                /* Just need to send a single byte with state value */
+                uint8_t state = 0x01;  /* State: Active */
                 
-                int err = send_notification_safely(notify_buffer, 2);
+                int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
                 if (err) {
                     LOG_ERR("CPR session ACTIVE state notification failed (err %d)", err);
                     /* Don't update state so we'll try again next time */
@@ -636,11 +676,10 @@ static void led_timer_handler(struct k_timer *timer)
                     last_notified_state = cpr_session_active;  /* Update notified state */
                 }
             } else {
-                /* Format: [TYPE][STATE=0x00] */
-                notify_buffer[0] = NOTIFY_TYPE_CPR_STATE;  /* Message type: CPR Session State */
-                notify_buffer[1] = 0x00;  /* State: Inactive */
+                /* Just need to send a single byte with state value */
+                uint8_t state = 0x00;  /* State: Inactive */
                 
-                int err = send_notification_safely(notify_buffer, 2);
+                int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
                 if (err) {
                     LOG_ERR("CPR session INACTIVE state notification failed (err %d)", err);
                     /* Don't update state so we'll try again next time */
@@ -667,21 +706,22 @@ static void led_timer_handler(struct k_timer *timer)
             uint32_t minutes = elapsed_sec / 60;
             uint32_t seconds = elapsed_sec % 60;
             
-            /* Format: [TYPE][CMD][STATUS][TIME_STR] */
-            notify_buffer[0] = NOTIFY_TYPE_CPR_CMD_ACK;  /* Message type: CPR Command ACK */
-            notify_buffer[1] = CPR_CMD_START;            /* Command: Start CPR */
-            notify_buffer[2] = STATUS_OK;                /* Status: OK */
+            /* Prepare a payload with command details and formatted time */
+            uint8_t payload[20]; /* Plenty of space for command data + time string */
+            
+            payload[0] = CPR_CMD_START;       /* Command: Start CPR */
+            payload[1] = STATUS_OK;           /* Status: OK */
             
             /* Add formatted time string "cpr:MM:SS" */
             char time_str[10];
             snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
             size_t str_len = strlen(time_str);
             
-            /* Copy the string to the notification buffer */
-            memcpy(&notify_buffer[3], time_str, str_len);
+            /* Copy the string to the payload */
+            memcpy(&payload[2], time_str, str_len);
             
-            /* Send notification with time string */
-            int err = send_notification_safely(notify_buffer, 3 + str_len);
+            /* Send notification with command details and time string */
+            int err = send_ble_notification(NOTIFY_TYPE_CPR_CMD_ACK, payload, 2 + str_len);
             if (err) {
                 LOG_ERR("CPR start acknowledgment failed (err %d)", err);
                 /* Don't mark as sent so we'll retry later */
@@ -704,25 +744,26 @@ static void led_timer_handler(struct k_timer *timer)
             uint32_t minutes = elapsed_sec / 60;
             uint32_t seconds = elapsed_sec % 60;
             
-            /* Format: [TYPE][CMD][STATUS][TIME_STR] */
-            notify_buffer[0] = NOTIFY_TYPE_CPR_CMD_ACK;     /* Message type: CPR Command ACK */
-            notify_buffer[1] = CPR_CMD_STOP;                /* Command: Stop CPR */
-            notify_buffer[2] = STATUS_OK;                   /* Status: OK */
+            /* Prepare a payload with command details, duration, and formatted time */
+            uint8_t payload[20]; /* Plenty of space for command data + time string */
+            
+            payload[0] = CPR_CMD_STOP;               /* Command: Stop CPR */
+            payload[1] = STATUS_OK;                  /* Status: OK */
             
             /* Format binary duration as well */
-            notify_buffer[3] = (elapsed_sec >> 8) & 0xFF;   /* Duration high byte */
-            notify_buffer[4] = elapsed_sec & 0xFF;          /* Duration low byte */
+            payload[2] = (elapsed_sec >> 8) & 0xFF;  /* Duration high byte */
+            payload[3] = elapsed_sec & 0xFF;         /* Duration low byte */
             
             /* Add formatted time string "cpr:MM:SS" */
             char time_str[10];
             snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
             size_t str_len = strlen(time_str);
             
-            /* Copy the string to the notification buffer */
-            memcpy(&notify_buffer[5], time_str, str_len);
+            /* Copy the string to the payload */
+            memcpy(&payload[4], time_str, str_len);
             
-            /* Send notification with both binary duration and formatted time string */
-            int err = send_notification_safely(notify_buffer, 5 + str_len);
+            /* Send notification with command details, duration, and time string */
+            int err = send_ble_notification(NOTIFY_TYPE_CPR_CMD_ACK, payload, 4 + str_len);
             if (err) {
                 LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
                 /* Don't mark as sent so we'll retry later */
@@ -745,10 +786,6 @@ static void led_timer_handler(struct k_timer *timer)
             /* Prepare a structured notification with user role info */
             char id_buffer[20];
             
-            /* Format: [TYPE=0x10][ROLE=0x01/0x02][ID_LEN][ID_DATA...] */
-            notify_buffer[0] = 0x10;  /* Message type: User Role */
-            notify_buffer[1] = role;  /* Role: 1=Instructor, 2=Trainee */
-            
             /* Get the ID string based on role */
             size_t id_len = 0;
             if (role == USER_ROLE_INSTRUCTOR) {
@@ -759,11 +796,15 @@ static void led_timer_handler(struct k_timer *timer)
             
             /* Add ID to notification if we have one */
             if (id_len > 0) {
-                notify_buffer[2] = (uint8_t)id_len;
-                memcpy(&notify_buffer[3], id_buffer, id_len);
+                /* Prepare payload with role and ID */
+                uint8_t payload[22]; /* 2 bytes for role and length + up to 20 for ID */
+                
+                payload[0] = role;               /* Role: 1=Instructor, 2=Trainee */
+                payload[1] = (uint8_t)id_len;    /* Length of ID string */
+                memcpy(&payload[2], id_buffer, id_len);
                 
                 /* Send notification with user role data */
-                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 3 + id_len);
+                int err = send_ble_notification(NOTIFY_TYPE_USER_ROLE, payload, 2 + id_len);
                 if (err) {
                     LOG_ERR("User role notification failed (err %d)", err);
                 } else {
@@ -778,13 +819,14 @@ static void led_timer_handler(struct k_timer *timer)
             size_t time_len = get_time_data(time_buffer, sizeof(time_buffer));
             
             if (time_len > 0) {
-                /* Format: [TYPE=0x20][TIME_LEN][TIME_DATA...] */
-                notify_buffer[0] = 0x20;  /* Message type: Time Data */
-                notify_buffer[1] = (uint8_t)time_len;
-                memcpy(&notify_buffer[2], time_buffer, time_len);
+                /* Prepare payload with time data */
+                uint8_t payload[21]; /* 1 byte for length + up to 20 for time data */
+                
+                payload[0] = (uint8_t)time_len;  /* Length of time data */
+                memcpy(&payload[1], time_buffer, time_len);
                 
                 /* Send notification with time data */
-                int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], notify_buffer, 2 + time_len);
+                int err = send_ble_notification(NOTIFY_TYPE_TIME_DATA, payload, 1 + time_len);
                 if (err) {
                     LOG_ERR("Time data notification failed (err %d)", err);
                 } else {
