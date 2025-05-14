@@ -339,7 +339,7 @@ static int process_direct_command(uint8_t cmd_byte)
     LOG_INF("Processing direct command: 0x%02x", cmd_byte);
     
     /* Ensure CPR session is properly initialized before processing commands */
-    if (cmd_byte == CMD_CONTROL_START || cmd_byte == CMD_COMMAND_STOP) {
+    if (cmd_byte == CPR_CONTROL_START || cmd_byte == CPR_COMMAND_STOP) {
         LOG_INF("CPR command received, verifying CPR session state is properly initialized");
     }
     
@@ -354,7 +354,7 @@ static int process_direct_command(uint8_t cmd_byte)
             request_led_state(true);
             break;
             
-        case CMD_CONTROL_START:
+        case CPR_CONTROL_START:
             LOG_INF("Command: Start CPR");
             request_led_state(true);
             LOG_INF("Calling start_cpr_session() function");
@@ -362,7 +362,7 @@ static int process_direct_command(uint8_t cmd_byte)
             LOG_INF("CPR session should now be active");
             break;
             
-        case CMD_COMMAND_STOP:
+        case CPR_COMMAND_STOP:
             LOG_INF("Command: Stop CPR");
             request_led_state(false);
             stop_cpr_session();   /* Stop CPR session timing */
@@ -378,18 +378,31 @@ static int process_direct_command(uint8_t cmd_byte)
 
 static int process_command(uint8_t *cmd_data, uint16_t len)
 {
-    /* Check specifically for timedata command right away */
-    if (len > 4 && cmd_data[0] == MSG_COMMAND_BYTE_START && 
-        cmd_data[2] == MSG_COMMAND_MSG_COLON && cmd_data[3] == CMD_COMMAND_TIMEDATA) {
-        LOG_INF("*** TIME DATA COMMAND DETECTED! ***");
+    /* Check for protocol-formatted command: START_BYTE + LENGTH_BYTE + COLON + ... */
+    if (len >= 6 && cmd_data[0] == BLE_COMMAND_BYTE_START && 
+        cmd_data[2] == BLE_COMMAND_MSG_COLON) {
+        
+        LOG_INF("Protocol-formatted command detected");
+        
+        /* Extract the length byte and verify */
+        uint8_t length_byte = cmd_data[1];
+        uint8_t command_byte = cmd_data[3];
+        
+        LOG_INF("Command format: START[%02x] LEN[%02x] COLON[%02x] CMD[%02x]...", 
+               cmd_data[0], length_byte, cmd_data[2], command_byte);
+        
+        /* Check specifically for timedata command */
+        if (command_byte == CMD_COMMAND_TIMEDATA) {
+            LOG_INF("*** TIME DATA COMMAND DETECTED! ***");
+        }
+    } else {
+        /* Basic command logging for non-protocol format */
+        LOG_INF("Command format (non-protocol): [%02x][%02x][%02x][%02x]...", 
+               (len > 0) ? cmd_data[0] : 0,
+               (len > 1) ? cmd_data[1] : 0,
+               (len > 2) ? cmd_data[2] : 0,
+               (len > 3) ? cmd_data[3] : 0);
     }
-    
-    /* Basic command logging */
-    LOG_INF("Command format: [%02x][%02x][%02x][%02x]...", 
-           (len > 0) ? cmd_data[0] : 0,
-           (len > 1) ? cmd_data[1] : 0,
-           (len > 2) ? cmd_data[2] : 0,
-           (len > 3) ? cmd_data[3] : 0);
            
     /* Already checked for timedata command above */
     
@@ -492,12 +505,12 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
                 LOG_INF("Command: LED ON");
                 request_led_state(true);
             }
-            else if (command == CMD_CONTROL_START) {
+            else if (command == CPR_CONTROL_START) {
                 LOG_INF("Command: Start CPR");
                 request_led_state(true);
                 start_cpr_session();  /* Start CPR session timing */
             }
-            else if (command == CMD_COMMAND_STOP) {
+            else if (command == CPR_COMMAND_STOP) {
                 LOG_INF("Command: Stop CPR");
                 request_led_state(false);
                 stop_cpr_session();   /* Stop CPR session timing */

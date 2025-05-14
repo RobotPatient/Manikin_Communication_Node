@@ -21,13 +21,17 @@
 #define MSG_COMMAND_MSG_SEMICOLON    0x3B
 #define MSG_COMMAND_MSG_END          0x17
 
-/* Command types */
-#define CMD_CONTROL_LED_OFF          0x00
-#define CMD_CONTROL_LED_ON           0x01
-#define CMD_CONTROL_START            0x02
-#define CMD_COMMAND_STOP             0x03
-#define CMD_COMMAND_DATA             0x04
-#define CMD_COMMAND_TIMEDATA         0x05
+/* Command types - aligned with protocol spec */
+#define CMD_CONTROL_LED_OFF          0x00    /* LED off - internal use only */
+#define CMD_CONTROL_LED_ON           0x01    /* LED on - internal use only */
+#define CMD_CONTROL_START            0x02    /* Start CPR command */
+#define CMD_COMMAND_STOP             0x03    /* Stop CPR command */
+#define CMD_COMMAND_DATA             0x04    /* Send ID data command */
+#define CMD_COMMAND_TIMEDATA         0x05    /* Send date/time command */
+
+/* Protocol command constants for compatibility with ble_notifications.h */
+#define CPR_CONTROL_START            CMD_CONTROL_START   /* Start CPR command */
+#define CPR_COMMAND_STOP             CMD_COMMAND_STOP    /* Stop CPR command */
 
 /* User role identifiers */
 #define USER_ROLE_INSTRUCTOR_PREFIX  "in:"

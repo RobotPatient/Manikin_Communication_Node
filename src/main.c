@@ -10,7 +10,11 @@
 #include <zephyr/drivers/gpio.h>
 #include "message_processor/message_processor.h"
 #include "ble/led_svc.h"
+#include "ble/ble_protocol.h"
 #include "ble_notifications.h"
+
+/* External declaration for protocol test function */
+extern void test_ble_protocol(void);
 
 
 /* Include message processing commands */
@@ -26,7 +30,7 @@ uint32_t connection_time = 0;   /* Time when connection was established */
 uint32_t connection_ready_delay = 2000;  /* Delay in ms before sending notifications */
 
 /* Global notification buffer and state */
-static uint8_t notify_buffer[20] = {0};
+static uint8_t notify_buffer[64] = {0}; /* Increased from 20 to 64 bytes to accommodate protocol format */
 
 /* Forward declarations for CPR session management */
 bool is_cpr_session_active(void);
@@ -37,13 +41,12 @@ uint32_t get_cpr_session_time(void);
 /* Forward declaration of our notification helper functions */
 static int send_notification_safely(const void *data, uint16_t len);
 
-/* Helper function to prepare and send a notification
+/* Helper function to prepare and send a notification using protocol format
  * 
  * This function handles:
- * 1. Adding the command start byte
- * 2. Adding the message type
- * 3. Adding payload data
- * 4. Safely sending the notification with connection checks
+ * 1. Formatting according to protocol: START_BYTE + LENGTH_BYTE + COLON + MESSAGE + SEMICOLON + END_BYTE
+ * 2. Adding payload data
+ * 3. Safely sending the notification with connection checks
  *
  * Usage:
  * - For simple notifications with a single value:
@@ -51,35 +54,106 @@ static int send_notification_safely(const void *data, uint16_t len);
  *
  * - For notifications with multiple fields, create the payload first, then call:
  *   send_ble_notification(MSG_TYPE_X, payload, payload_size);
+ * 
+ * - For command acknowledgments, use send_command_ack() instead
  */
 static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t payload_len) {
+    /* Calculate the total required buffer size: 
+     * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + SEMICOLON(1) + END_BYTE(1)
+     * This is 6 bytes overhead plus payload_len: START + LEN + COLON + MSG_TYPE + SEMICOLON + END
+     */
+    uint16_t total_len = 6 + payload_len; // 6 = START + LEN + COLON + MSG_TYPE + SEMICOLON + END
+    
     /* Check if we have space in buffer */
-    if (payload_len + 2 > sizeof(notify_buffer)) {
-        LOG_ERR("Notification payload too large: %d bytes", payload_len);
+    if (total_len > sizeof(notify_buffer)) {
+        LOG_ERR("Notification too large: %d bytes, max %d", total_len, sizeof(notify_buffer));
         return -EINVAL;
     }
     
-    /* Format the notification with start byte and message type */
-    notify_buffer[0] = BLE_COMMAND_BYTE_START;  /* Start byte */
-    notify_buffer[1] = msg_type;                /* Message type */
+    /* Format the notification according to protocol */
+    notify_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
+    notify_buffer[1] = payload_len + 1;          /* LENGTH_BYTE - payload plus msg_type byte */
+    notify_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
+    notify_buffer[3] = msg_type;                 /* Message type */
     
     /* Add payload data if provided */
     if (payload != NULL && payload_len > 0) {
-        memcpy(&notify_buffer[2], payload, payload_len);
+        memcpy(&notify_buffer[4], payload, payload_len);
     }
     
+    /* Add terminating bytes */
+    notify_buffer[4 + payload_len] = BLE_COMMAND_MSG_SEMICOLON; /* SEMICOLON */
+    notify_buffer[5 + payload_len] = BLE_COMMAND_MSG_END;       /* END_BYTE */
+    
     /* Send notification */
-    return send_notification_safely(notify_buffer, payload_len + 2);
+    return send_notification_safely(notify_buffer, total_len);
 }
+
+/* Helper function to send a command acknowledgment
+ * 
+ * This function creates a command acknowledgment with the same command value
+ * that the iOS app is expecting according to the protocol spec
+ *
+ * @param cmd_byte - The original command byte to acknowledge (e.g., CPR_CONTROL_START)
+ * @return 0 on success, negative error code on failure
+ */
+static int send_command_ack(uint8_t cmd_byte) {
+    /* Format according to protocol: START_BYTE + LENGTH_BYTE + COLON + CMD_BYTE + SEMICOLON + END_BYTE */
+    uint8_t ack_buffer[6];
+    
+    ack_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
+    ack_buffer[1] = 0x01;                     /* LENGTH_BYTE - just the command byte */
+    ack_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
+    ack_buffer[3] = cmd_byte;                 /* Original command byte */
+    ack_buffer[4] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON */
+    ack_buffer[5] = BLE_COMMAND_MSG_END;      /* END_BYTE */
+    
+    LOG_INF("Sending command acknowledgment for cmd: 0x%02x", cmd_byte);
+    
+    /* Send the acknowledgment */
+    return send_notification_safely(ack_buffer, sizeof(ack_buffer));
+}
+
+/* The notification characteristic is at index 4 in our service definition, based on:
+ * BT_GATT_SERVICE_DEFINE(custom_svc,
+ *    [0] BT_GATT_PRIMARY_SERVICE(&custom_service_uuid),
+ *    
+ *    [1] BT_GATT_CHARACTERISTIC(&custom_char_uuid.uuid,...)   <-- Declaration
+ *    [2] ...                                                   <-- Value
+ *    
+ *    [3] BT_GATT_CHARACTERISTIC(&custom_notify_uuid.uuid,...)  <-- Declaration
+ *    [4] ...                                                    <-- Value (what we want)
+ *    [5] BT_GATT_CCC(...)                                       <-- CCC descriptor
+ *    
+ *    [6] BT_GATT_CHARACTERISTIC(...                            <-- CPR State Char
+ */
 
 /* Helper function for checking connection and sending notifications */
 static int send_notification_safely(const void *data, uint16_t len) {
+    /* Index 4 is the notification characteristic value attribute, from counting in service definition */
+    static const int NOTIFY_CHAR_INDEX = 4;
+    
+    /* Track whether we've warned about missing connection */
+    static uint32_t last_warning_time = 0;
+    
+    /* Track last ENOTSUP warning time to avoid log spam */
+    static uint32_t last_enotsup_warning = 0;
+    
+    /* Rate limiter for notifications to prevent buffer overflow */
+    static uint32_t last_notification_time = 0;
+    static const uint32_t MIN_NOTIFICATION_INTERVAL = 100; /* Min 100ms between notifications for STM32H7 */
+    
     /* We need extern declaration for custom_svc which is defined by BT_GATT_SERVICE_DEFINE macro */
     extern const struct bt_gatt_service_static custom_svc;
     
     /* Only proceed if we have a valid connection that's had time to stabilize */
     if (!is_connected || !current_conn) {
-        LOG_WRN("Cannot send notification - no active connection");
+        /* Only log warning once per 5 seconds to reduce log spam */
+        uint32_t now = k_uptime_get_32();
+        if (now - last_warning_time > 5000) {
+            LOG_WRN("Cannot send notification - no active connection");
+            last_warning_time = now;
+        }
         return -ENOTCONN;
     }
     
@@ -91,22 +165,89 @@ static int send_notification_safely(const void *data, uint16_t len) {
         return -EAGAIN;
     }
     
+    /* Check if we're sending notifications too quickly */
+    if (now - last_notification_time < MIN_NOTIFICATION_INTERVAL) {
+        LOG_DBG("Rate limiting notification, too soon after previous (%u ms)",
+               now - last_notification_time);
+        return -EAGAIN;
+    }
+    
     /* Try to send the notification */
-    int err = bt_gatt_notify(NULL, &custom_svc.attrs[4], data, len);
+    LOG_DBG("Sending notification: len=%d using attr[%d]", len, NOTIFY_CHAR_INDEX);
+    int err = bt_gatt_notify(NULL, &custom_svc.attrs[NOTIFY_CHAR_INDEX], data, len);
+    
+    /* Update last notification time if successful or if we encountered buffer issues */
+    if (err == 0 || err == -ENOMEM) {
+        last_notification_time = now;
+    }
     
     /* Handle any errors */
     if (err) {
-        LOG_ERR("Notification failed (err %d)", err);
+        /* Only log detailed errors for non-connection issues to reduce spam */
+        if (err != -ENOTCONN) {
+            LOG_ERR("Notification failed (err %d): %s", err, 
+                    err == -ENOTSUP ? "ENOTSUP - Not supported" :
+                    err == -EINVAL ? "EINVAL - Invalid parameter" :
+                    err == -ENOTCONN ? "ENOTCONN - Not connected" :
+                    err == -ENOMEM ? "ENOMEM - Out of memory" : "Unknown error");
+        }
         
-        /* If error indicates connection issue, clear our connection state */
-        if (err == -BT_ATT_ERR_UNLIKELY || err == -ENOMEM) {
-            LOG_ERR("Connection issue detected, resetting connection state");
+        /* Only log ENOTSUP errors occasionally */
+        static uint32_t last_enotsup_time = 0;
+        uint32_t now_err = k_uptime_get_32();
+        
+        if (err == -ENOTSUP) {
+            /* Use separate tracking for client notification status vs warnings */
+            if (now_err - last_enotsup_time > 10000) {
+                LOG_WRN("Client hasn't enabled notifications or attribute doesn't support them");
+                last_enotsup_time = now_err;
+            }
+            
+            /* Record the ENOTSUP status for each notification type */
+            if (data && len >= 4) {
+                /* Extract the message type from the notification format */
+                uint8_t *msg_data = (uint8_t*)data;
+                if (msg_data[0] == BLE_COMMAND_BYTE_START && 
+                    msg_data[2] == BLE_COMMAND_MSG_COLON) {
+                    uint8_t msg_type = msg_data[3];
+                    
+                    /* Only log specific notification types occasionally */
+                    if (now_err - last_enotsup_warning > 5000) {
+                        LOG_DBG("Notification type 0x%02x not enabled by client", msg_type);
+                        last_enotsup_warning = now_err;
+                    }
+                }
+            }
+        }
+        
+        /* Special handling with ACL flow control enabled */
+        if (err == -ENOMEM) {
+            /* With ACL flow control, this is likely temporary buffer exhaustion - add more backoff */
+            static uint32_t last_backoff_time = 0;
+            if (now_err - last_backoff_time > 2000) {
+                LOG_WRN("BLE stack buffer full (-ENOMEM), adding 250ms backoff");
+                last_backoff_time = now_err;
+            }
+            /* Increase backoff time to 250ms to allow stack to recover */
+            last_notification_time = now + 200;
+        }
+        else if (err == -BT_ATT_ERR_UNLIKELY || err == -ENOTCONN) {
+            /* Only log connection resets occasionally */
+            static uint32_t last_conn_reset_time = 0;
+            if (now_err - last_conn_reset_time > 5000) {
+                LOG_ERR("Connection issue detected, resetting connection state");
+                last_conn_reset_time = now_err;
+            }
+            
+            /* Reset connection on critical errors */
             if (current_conn) {
                 bt_conn_unref(current_conn);
                 current_conn = NULL;
             }
             is_connected = false;
         }
+    } else {
+        LOG_DBG("Notification sent successfully");
     }
     
     return err;
@@ -114,6 +255,19 @@ static int send_notification_safely(const void *data, uint16_t len) {
 
 /* Constants moved to ble_notifications.h */
 static bool notify_enabled = false;
+static bool connection_notif_reset_needed = true; /* Track when we need to reset notification states */
+
+/* Per-connection tracking for notification support */
+static struct {
+    bool heartbeat_works;
+    bool role_works;
+    bool time_works;
+    bool led_works;
+    bool cpr_works;
+} notification_support = {false, false, false, false, false};
+
+/* Reference stream_notify_enable from ble_handlers.c */
+extern volatile bool stream_notify_enable;
 
 /* Always allow CPR notifications, even if standard notifications aren't enabled */
 static bool cpr_notifications_allowed = true;
@@ -245,8 +399,15 @@ static struct bt_uuid_128 custom_notify_uuid = BT_UUID_INIT_128(
 static struct bt_uuid_128 cpr_state_char_uuid = BT_UUID_INIT_128(
     BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef3));
 
+/* iOS Command characteristic UUID - specific for iOS app commands that require write with response */
+static struct bt_uuid_128 ios_cmd_char_uuid = BT_UUID_INIT_128(
+    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef4));
+
 /* Forward declaration of our GATT service (defined later with BT_GATT_SERVICE_DEFINE) */
 extern const struct bt_gatt_service_static custom_svc;
+
+/* Buffer for iOS commands (using Write With Response) - increase buffer size */
+static uint8_t ios_cmd_buffer[128];
 
 /* Write callback for custom characteristic */
 static ssize_t custom_char_write(struct bt_conn *conn,
@@ -266,6 +427,35 @@ static ssize_t custom_char_write(struct bt_conn *conn,
     /* Print the data as hex for debugging */
     LOG_HEXDUMP_INF(buf, len, "Received data");
 
+    /* Parse the command to see if we need to send an immediate acknowledgment */
+    if (len >= 6 && 
+        ((uint8_t*)buf)[0] == BLE_COMMAND_BYTE_START && 
+        ((uint8_t*)buf)[2] == BLE_COMMAND_MSG_COLON) {
+        
+        /* Extract the command byte */
+        uint8_t cmd_byte = ((uint8_t*)buf)[3];
+        
+        /* Check if this is a command that requires immediate acknowledgment */
+        if (cmd_byte == CPR_CONTROL_START || 
+            cmd_byte == CPR_COMMAND_STOP || 
+            cmd_byte == CMD_COMMAND_DATA ||
+            cmd_byte == CMD_COMMAND_TIMEDATA) {
+            
+            LOG_INF("Received command 0x%02x, sending immediate acknowledgment", cmd_byte);
+            
+            /* Send an acknowledgment with the same command byte */
+            int err = send_command_ack(cmd_byte);
+            
+            /* Only log success or non-connection errors */
+            if (err == 0) {
+                LOG_INF("Command acknowledgment sent for cmd 0x%02x", cmd_byte);
+            } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                /* We don't log connection errors because they're expected when no device is connected */
+                LOG_ERR("Failed to send command acknowledgment (err %d)", err);
+            }
+        }
+    }
+
     /* Submit the received data to the message processor */
     int ret = submit_command(buf, len);
     if (ret) {
@@ -274,18 +464,96 @@ static ssize_t custom_char_write(struct bt_conn *conn,
         LOG_INF("Command submitted to message processor successfully");
     }
 
-    /* Notify clients of received data using the helper function */
-    if (notify_enabled && len <= sizeof(notify_buffer)) {
-        /* Echo back data with standard message format using helper function */
-        int err = send_ble_notification(NOTIFY_TYPE_HEARTBEAT, buf, len);
-        if (err) {
-            LOG_ERR("Notification failed (err %d)", err);
-        } else {
-            LOG_INF("Notification sent, length: %d bytes", len);
+    return len;
+}
+
+/* Write callback for iOS command characteristic - with proper write-with-response support */
+static ssize_t ios_cmd_write(struct bt_conn *conn,
+                             const struct bt_gatt_attr *attr,
+                             const void *buf, uint16_t len,
+                             uint16_t offset, uint8_t flags)
+{
+    LOG_INF("iOS command received, length: %d bytes, offset: %d, flags: 0x%02x", len, offset, flags);
+    
+    /* Print the data as hex for debugging */
+    LOG_HEXDUMP_INF(buf, len, "iOS command data");
+    
+    /* Check buffer size */
+    if (offset + len > sizeof(ios_cmd_buffer)) {
+        LOG_ERR("iOS command buffer overflow (%d > %d)", offset + len, sizeof(ios_cmd_buffer));
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+    }
+
+    /* Copy data to our buffer */
+    memcpy(ios_cmd_buffer + offset, buf, len);
+    
+    /* If this is the beginning of a long write, wait for the complete data */
+    if (flags & BT_GATT_WRITE_FLAG_PREPARE) {
+        LOG_INF("Prepare write received, waiting for more data or execute");
+        return len;
+    }
+    
+    /* If it's a partial write, wait for the complete data */
+    if (offset > 0 && !(flags & BT_GATT_WRITE_FLAG_EXECUTE)) {
+        LOG_INF("Partial write at offset %d, waiting for more data", offset);
+        return len;
+    }
+    
+    /* At this point we have the complete data, process it */
+    uint16_t total_len = offset + len;
+    LOG_INF("Processing complete iOS command data, total length: %d bytes", total_len);
+    
+    /* Parse the command to see if we need to send an immediate acknowledgment */
+    if (total_len >= 6 && 
+        ios_cmd_buffer[0] == BLE_COMMAND_BYTE_START && 
+        ios_cmd_buffer[2] == BLE_COMMAND_MSG_COLON) {
+        
+        /* Extract the command byte */
+        uint8_t cmd_byte = ios_cmd_buffer[3];
+        
+        LOG_INF("Received valid formatted iOS command with type 0x%02x", cmd_byte);
+        
+        /* Check if this is a command that requires immediate acknowledgment */
+        if (cmd_byte == CPR_CONTROL_START || 
+            cmd_byte == CPR_COMMAND_STOP || 
+            cmd_byte == CMD_COMMAND_DATA ||
+            cmd_byte == CMD_COMMAND_TIMEDATA) {
+            
+            LOG_INF("Received iOS command 0x%02x, sending immediate acknowledgment", cmd_byte);
+            
+            /* Before sending ack, process the command through message processor */
+            int ret = submit_command(ios_cmd_buffer, total_len);
+            if (ret) {
+                LOG_ERR("Failed to submit iOS command to message processor (err %d)", ret);
+            } else {
+                LOG_INF("iOS command submitted to message processor successfully");
+            }
+            
+            /* Send an acknowledgment with the same command byte */
+            int err = send_command_ack(cmd_byte);
+            
+            /* Only log success or non-connection errors */
+            if (err == 0) {
+                LOG_INF("iOS Command acknowledgment sent for cmd 0x%02x", cmd_byte);
+            } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                /* We don't log connection errors because they're expected when no device is connected */
+                LOG_ERR("Failed to send iOS command acknowledgment (err %d)", err);
+            }
+            
+            return total_len;
         }
     }
 
-    return len;
+    /* If not a special command or invalid format, still process it normally */
+    LOG_INF("Processing general iOS command");
+    int ret = submit_command(ios_cmd_buffer, total_len);
+    if (ret) {
+        LOG_ERR("Failed to submit iOS command to message processor (err %d)", ret);
+    } else {
+        LOG_INF("iOS command submitted to message processor successfully");
+    }
+
+    return total_len;
 }
 
 /* Message types are defined in ble_notifications.h */
@@ -293,16 +561,39 @@ static ssize_t custom_char_write(struct bt_conn *conn,
 /* Notification timer callback */
 static void notify_timer_handler(struct k_timer *timer)
 {
-    if (notify_enabled) {
-        /* Update the notification data with a counter */
-        notify_count++;
+    /* Only send notifications if enabled AND we have a stable connection */
+    if (notify_enabled && is_connected && current_conn) {
+        /* Check if enough time has passed since the last notification attempt to reduce errors */
+        uint32_t now = k_uptime_get_32();
+        static uint32_t last_sent_time = 0;
         
-        /* Send heartbeat notification */
-        int err = send_ble_notification(NOTIFY_TYPE_HEARTBEAT, &notify_count, sizeof(notify_count));
-        if (err) {
-            LOG_ERR("Periodic notification failed (err %d)", err);
-        } else {
-            LOG_INF("Periodic notification sent: %d", notify_count);
+        if (now - last_sent_time >= 250) { /* Ensure at least 250ms between heartbeats */
+            /* Update the notification data with a counter */
+            notify_count++;
+            
+            /* Only try sending if global tracking says it works */
+            static uint32_t last_heartbeat_attempt = 0;
+            
+            /* Only try sending if it's worked before or we haven't tried in a while */
+            if (notification_support.heartbeat_works || (now - last_heartbeat_attempt > 60000)) {
+                last_heartbeat_attempt = now;
+                
+                /* Try sending heartbeat notification */
+                int err = send_ble_notification(NOTIFY_TYPE_HEARTBEAT, &notify_count, sizeof(notify_count));
+                
+                if (err == 0) {
+                    LOG_DBG("Periodic notification sent: %d", notify_count);
+                    last_sent_time = now;
+                    notification_support.heartbeat_works = true;
+                } else if (err == -ENOTSUP) {
+                    /* This iOS client doesn't support heartbeat notifications */
+                    notification_support.heartbeat_works = false;
+                    LOG_INF("Heartbeat notifications disabled - not supported by client");
+                } else if (err != -ENOTCONN) {
+                    /* Log other non-connection errors */
+                    LOG_ERR("Periodic notification failed (err %d)", err);
+                }
+            }
         }
     }
 }
@@ -326,7 +617,7 @@ static ssize_t cpr_state_read(struct bt_conn *conn,
     cpr_state_buffer[4] = elapsed_sec & 0xFF;          /* LSB */
     
     /* Add formatted time string "cpr:MM:SS" */
-    char time_str[10];
+    char time_str[16]; /* Increased buffer size to avoid truncation warnings */
     snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
     size_t str_len = strlen(time_str);
     
@@ -367,7 +658,7 @@ static void notify_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 BT_GATT_SERVICE_DEFINE(custom_svc,
     BT_GATT_PRIMARY_SERVICE(&custom_service_uuid),
     
-    /* Read/Write characteristic */
+    /* Read/Write characteristic - for typical commands without response */
     BT_GATT_CHARACTERISTIC(&custom_char_uuid.uuid,
                           BT_GATT_CHRC_WRITE | BT_GATT_CHRC_READ,
                           BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
@@ -376,8 +667,9 @@ BT_GATT_SERVICE_DEFINE(custom_svc,
     /* Notification characteristic */
     BT_GATT_CHARACTERISTIC(&custom_notify_uuid.uuid,
                           BT_GATT_CHRC_NOTIFY,
-                          BT_GATT_PERM_READ,
+                          BT_GATT_PERM_NONE,  /* No direct read/write perms - notifications only */
                           NULL, NULL, notify_buffer),
+    /* Client Characteristic Configuration - required for notifications to work */
     BT_GATT_CCC(notify_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
     
     /* CPR State characteristic - with read and notify capabilities */
@@ -386,6 +678,12 @@ BT_GATT_SERVICE_DEFINE(custom_svc,
                           BT_GATT_PERM_READ,
                           cpr_state_read, NULL, cpr_state_buffer),
     BT_GATT_CCC(notify_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+                          
+    /* iOS Command characteristic - specifically for 'write with response' operations */
+    BT_GATT_CHARACTERISTIC(&ios_cmd_char_uuid.uuid,
+                          BT_GATT_CHRC_WRITE,  /* Only write with response, no notify/read */
+                          BT_GATT_PERM_WRITE | BT_GATT_PERM_PREPARE_WRITE,  /* Support long writes */
+                          NULL, ios_cmd_write, ios_cmd_buffer),
 );
 
 /* Note: Using minimal advertising data directly in the advertising function */
@@ -402,11 +700,11 @@ static void advertising_work_handler(struct k_work *work)
     /* Stop any existing advertising */
     bt_le_adv_stop();
     
-    /* Define the most minimal advertising parameters possible */
+    /* Define advertising parameters with higher reliability */
     static const struct bt_le_adv_param param = {
-        .options = BT_LE_ADV_OPT_CONN,  /* Use the simpler connectable flag */
-        .interval_min = BT_GAP_ADV_SLOW_INT_MIN,  /* Use slower interval for stability */
-        .interval_max = BT_GAP_ADV_SLOW_INT_MAX,
+        .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_ONE_TIME,  /* Connectable and one-time flag */
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,  /* Use faster interval for better response */
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
         .id = BT_ID_DEFAULT,
         .sid = 0,
         .secondary_max_skip = 0,
@@ -516,6 +814,18 @@ static void connected(struct bt_conn *conn, uint8_t err)
     cpr_session_active = false;
     cpr_session_start_time = 0;
     
+    /* Reset notification tracking for all notification types on new connection */
+    connection_notif_reset_needed = true;
+    
+    /* Reset notification support tracking for new connection */
+    notification_support.heartbeat_works = true; /* Try once for each type */
+    notification_support.role_works = true;
+    notification_support.time_works = true;
+    notification_support.led_works = true;
+    notification_support.cpr_works = true;
+    
+    LOG_INF("Reset notification support tracking for new connection");
+    
     LOG_INF("Connection established at %u ms, allowing %u ms before notifications",
            connection_time, connection_ready_delay);
 }
@@ -573,10 +883,13 @@ static void led_timer_handler(struct k_timer *timer)
             uint8_t led_state = led_requested_state ? 0x01 : 0x00;
             
             int err = send_ble_notification(NOTIFY_TYPE_LED_STATE, &led_state, sizeof(led_state));
-            if (err) {
-                LOG_ERR("LED state notification failed (err %d)", err);
-            } else {
+            
+            /* Only log success or non-connection errors */
+            if (err == 0) {
                 LOG_INF("LED state notification sent: %d", led_requested_state);
+            } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                /* We don't log connection errors because they're expected when no device is connected */
+                LOG_ERR("LED state notification failed (err %d)", err);
             }
         }
     }
@@ -605,7 +918,7 @@ static void led_timer_handler(struct k_timer *timer)
                 uint32_t seconds = elapsed_seconds % 60;
                 
                 /* Create a payload with [ELAPSED_SEC][TIME_STR] */
-                uint8_t payload[16]; /* Big enough for 4 bytes elapsed time + string */
+                uint8_t payload[32]; /* Increased size to handle protocol overhead */
                 
                 /* Add elapsed time as 32-bit value */
                 payload[0] = (elapsed_seconds >> 24) & 0xFF;
@@ -614,7 +927,7 @@ static void led_timer_handler(struct k_timer *timer)
                 payload[3] = elapsed_seconds & 0xFF;
                 
                 /* Add formatted time string "cpr:MM:SS" */
-                char time_str[10];
+                char time_str[16]; /* Increased buffer size to avoid truncation warnings */
                 snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
                 size_t str_len = strlen(time_str);
                 
@@ -623,12 +936,14 @@ static void led_timer_handler(struct k_timer *timer)
                 
                 /* Send notification with both binary time and human-readable format */
                 int err = send_ble_notification(NOTIFY_TYPE_CPR_TIME, payload, 4 + str_len);
-                if (err) {
-                    LOG_ERR("CPR session time notification failed (err %d)", err);
-                    /* Error handling is done in send_notification_safely */
-                } else {
+                
+                /* Only log success or non-connection errors */
+                if (err == 0) {
                     LOG_DBG("CPR session time notification sent: %s (%u seconds)", 
                            time_str, elapsed_seconds);
+                } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                    /* We don't log connection errors because they're expected when no device is connected */
+                    LOG_ERR("CPR session time notification failed (err %d)", err);
                 }
             }
         }
@@ -668,24 +983,30 @@ static void led_timer_handler(struct k_timer *timer)
                 uint8_t state = 0x01;  /* State: Active */
                 
                 int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
-                if (err) {
-                    LOG_ERR("CPR session ACTIVE state notification failed (err %d)", err);
-                    /* Don't update state so we'll try again next time */
-                } else {
+                
+                /* Only log success or non-connection errors */
+                if (err == 0) {
                     LOG_INF("CPR session ACTIVE state notification sent successfully");
                     last_notified_state = cpr_session_active;  /* Update notified state */
+                } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                    /* We don't log connection errors because they're expected when no device is connected */
+                    LOG_ERR("CPR session ACTIVE state notification failed (err %d)", err);
+                    /* Don't update state so we'll try again next time */
                 }
             } else {
                 /* Just need to send a single byte with state value */
                 uint8_t state = 0x00;  /* State: Inactive */
                 
                 int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
-                if (err) {
-                    LOG_ERR("CPR session INACTIVE state notification failed (err %d)", err);
-                    /* Don't update state so we'll try again next time */
-                } else {
+                
+                /* Only log success or non-connection errors */
+                if (err == 0) {
                     LOG_INF("CPR session INACTIVE state notification sent successfully");
                     last_notified_state = cpr_session_active;  /* Update notified state */
+                } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                    /* We don't log connection errors because they're expected when no device is connected */
+                    LOG_ERR("CPR session INACTIVE state notification failed (err %d)", err);
+                    /* Don't update state so we'll try again next time */
                 }
             }
         } else {
@@ -707,13 +1028,13 @@ static void led_timer_handler(struct k_timer *timer)
             uint32_t seconds = elapsed_sec % 60;
             
             /* Prepare a payload with command details and formatted time */
-            uint8_t payload[20]; /* Plenty of space for command data + time string */
+            uint8_t payload[32]; /* Increased size to handle protocol overhead */
             
             payload[0] = CPR_CMD_START;       /* Command: Start CPR */
             payload[1] = STATUS_OK;           /* Status: OK */
             
             /* Add formatted time string "cpr:MM:SS" */
-            char time_str[10];
+            char time_str[16]; /* Increased buffer size to avoid truncation warnings */
             snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
             size_t str_len = strlen(time_str);
             
@@ -722,12 +1043,15 @@ static void led_timer_handler(struct k_timer *timer)
             
             /* Send notification with command details and time string */
             int err = send_ble_notification(NOTIFY_TYPE_CPR_CMD_ACK, payload, 2 + str_len);
-            if (err) {
-                LOG_ERR("CPR start acknowledgment failed (err %d)", err);
-                /* Don't mark as sent so we'll retry later */
-            } else {
+            
+            /* Only log success or non-connection errors */
+            if (err == 0) {
                 LOG_INF("CPR START command acknowledgment sent: OK with time %s", time_str);
                 start_ack_sent = true;
+            } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                /* We don't log connection errors because they're expected when no device is connected */
+                LOG_ERR("CPR start acknowledgment failed (err %d)", err);
+                /* Don't mark as sent so we'll retry later */
             }
         }
         
@@ -745,7 +1069,7 @@ static void led_timer_handler(struct k_timer *timer)
             uint32_t seconds = elapsed_sec % 60;
             
             /* Prepare a payload with command details, duration, and formatted time */
-            uint8_t payload[20]; /* Plenty of space for command data + time string */
+            uint8_t payload[32]; /* Increased size to handle protocol overhead */
             
             payload[0] = CPR_CMD_STOP;               /* Command: Stop CPR */
             payload[1] = STATUS_OK;                  /* Status: OK */
@@ -755,7 +1079,7 @@ static void led_timer_handler(struct k_timer *timer)
             payload[3] = elapsed_sec & 0xFF;         /* Duration low byte */
             
             /* Add formatted time string "cpr:MM:SS" */
-            char time_str[10];
+            char time_str[16]; /* Increased buffer size to avoid truncation warnings */
             snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
             size_t str_len = strlen(time_str);
             
@@ -764,13 +1088,16 @@ static void led_timer_handler(struct k_timer *timer)
             
             /* Send notification with command details, duration, and time string */
             int err = send_ble_notification(NOTIFY_TYPE_CPR_CMD_ACK, payload, 4 + str_len);
-            if (err) {
-                LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
-                /* Don't mark as sent so we'll retry later */
-            } else {
+            
+            /* Only log success or non-connection errors */
+            if (err == 0) {
                 LOG_INF("CPR STOP command acknowledgment sent: OK with time %s (%u seconds)", 
                         time_str, elapsed_sec);
                 stop_ack_sent = true;
+            } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                /* We don't log connection errors because they're expected when no device is connected */
+                LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
+                /* Don't mark as sent so we'll retry later */
             }
         }
     }
@@ -782,7 +1109,9 @@ static void led_timer_handler(struct k_timer *timer)
         last_role_check = now;
         
         uint8_t role = get_user_role();
-        if (role != USER_ROLE_NONE && notify_enabled) {
+        /* Check notification state AND connection status */
+        if (role != USER_ROLE_NONE && notify_enabled && 
+            is_connected && current_conn && (now - connection_time) >= connection_ready_delay) {
             /* Prepare a structured notification with user role info */
             char id_buffer[20];
             
@@ -797,40 +1126,71 @@ static void led_timer_handler(struct k_timer *timer)
             /* Add ID to notification if we have one */
             if (id_len > 0) {
                 /* Prepare payload with role and ID */
-                uint8_t payload[22]; /* 2 bytes for role and length + up to 20 for ID */
+                uint8_t payload[32]; /* Increased size to handle protocol overhead */
                 
                 payload[0] = role;               /* Role: 1=Instructor, 2=Trainee */
                 payload[1] = (uint8_t)id_len;    /* Length of ID string */
                 memcpy(&payload[2], id_buffer, id_len);
                 
-                /* Send notification with user role data */
-                int err = send_ble_notification(NOTIFY_TYPE_USER_ROLE, payload, 2 + id_len);
-                if (err) {
-                    LOG_ERR("User role notification failed (err %d)", err);
-                } else {
-                    LOG_INF("User role notification sent: role=%d, id=%s", role, id_buffer);
+                                /* Use global notification support tracking */
+                static uint32_t last_role_attempt = 0;
+                
+                /* Only try sending if it's worked before or we haven't tried in a while */
+                if (notification_support.role_works || (now - last_role_attempt > 60000)) {
+                    last_role_attempt = now;
+                    
+                    /* Try to send notification with role data */
+                    int err = send_ble_notification(NOTIFY_TYPE_USER_ROLE, payload, 2 + id_len);
+                    
+                    if (err == 0) {
+                        LOG_INF("User role notification sent: role=%d, id=%s", role, id_buffer);
+                        notification_support.role_works = true;
+                    } else if (err == -ENOTSUP) {
+                        /* This iOS client doesn't support role notifications, turn them off */
+                        notification_support.role_works = false;
+                        LOG_INF("User role notifications disabled - not supported by client");
+                    } else if (err != -ENOTCONN) {
+                        /* Log other non-connection errors */
+                        LOG_ERR("User role notification failed (err %d)", err);
+                    }
                 }
             }
         }
         
-        /* Also check for time data */
-        if (has_received_time_data() && notify_enabled) {
+        /* Also check for time data - verify both notifications AND connection status */
+        if (has_received_time_data() && notify_enabled && 
+            is_connected && current_conn && (now - connection_time) >= connection_ready_delay) {
             char time_buffer[20];
             size_t time_len = get_time_data(time_buffer, sizeof(time_buffer));
             
             if (time_len > 0) {
                 /* Prepare payload with time data */
-                uint8_t payload[21]; /* 1 byte for length + up to 20 for time data */
+                uint8_t payload[32]; /* Increased size to handle protocol overhead */
                 
                 payload[0] = (uint8_t)time_len;  /* Length of time data */
                 memcpy(&payload[1], time_buffer, time_len);
                 
-                /* Send notification with time data */
-                int err = send_ble_notification(NOTIFY_TYPE_TIME_DATA, payload, 1 + time_len);
-                if (err) {
-                    LOG_ERR("Time data notification failed (err %d)", err);
-                } else {
-                    LOG_INF("Time data notification sent: %s", time_buffer);
+                                /* Use global notification support tracking */
+                static uint32_t last_attempt_time = 0;
+                
+                /* Only try sending if it's worked before or we haven't tried in a while */
+                if (notification_support.time_works || (now - last_attempt_time > 60000)) {
+                    last_attempt_time = now;
+                    
+                    /* Try to send notification with time data */
+                    int err = send_ble_notification(NOTIFY_TYPE_TIME_DATA, payload, 1 + time_len);
+                    
+                    if (err == 0) {
+                        LOG_INF("Time data notification sent: %s", time_buffer);
+                        notification_support.time_works = true;
+                    } else if (err == -ENOTSUP) {
+                        /* This iOS client doesn't support time data notifications, turn them off */
+                        notification_support.time_works = false;
+                        LOG_INF("Time data notifications disabled - not supported by client");
+                    } else if (err != -ENOTCONN) {
+                        /* Log other non-connection errors */
+                        LOG_ERR("Time data notification failed (err %d)", err);
+                    }
                 }
             }
         }
@@ -907,16 +1267,20 @@ int main(void)
     LOG_INF("Sending LED OFF command to message processor");
     submit_direct_command(CMD_CONTROL_LED_OFF);
     
+    /* Test the BLE protocol formatting */
+    LOG_INF("Testing BLE protocol formatting");
+    test_ble_protocol();
+    
     /* Test CPR session commands */
     k_sleep(K_SECONDS(2));
     
     LOG_INF("Sending CPR START command to message processor");
-    submit_direct_command(CMD_CONTROL_START);
+    submit_direct_command(CPR_CONTROL_START);
     
     k_sleep(K_SECONDS(5));
     
     LOG_INF("Sending CPR STOP command to message processor");
-    submit_direct_command(CMD_COMMAND_STOP);
+    submit_direct_command(CPR_COMMAND_STOP);
     
     /* Direct LED control test for verification */
     k_sleep(K_SECONDS(2));
@@ -1014,17 +1378,33 @@ int main(void)
         if (!sent_time && k_uptime_get_32() > 15000) {
             LOG_INF("Sending test time data: 20250506150722");
             
-            /* Format: [Start][Cmd:TimeData][Time:20250506150722][End] */
-            uint8_t time_cmd[] = {
-                MSG_COMMAND_BYTE_START,  /* Start byte */
-                MSG_COMMAND_MSG_COLON,   /* Command separator */
-                CMD_COMMAND_TIMEDATA,    /* Time data command */
-                MSG_COMMAND_MSG_COLON,   /* Data separator */
-                '2', '0', '2', '5', '0', '5', '0', '6', '1', '5', '0', '7', '2', '2', /* Time data */
-                MSG_COMMAND_MSG_END      /* End byte */
-            };
+            /* Use the new protocol formatting */
+            const char *time_data = "20250506150722";
+            uint8_t time_cmd[32];
             
-            submit_command(time_cmd, sizeof(time_cmd));
+            int cmd_len = format_timedata_command(time_cmd, sizeof(time_cmd), 
+                                                time_data, strlen(time_data));
+            
+            if (cmd_len > 0) {
+                LOG_INF("Formatted time data command using protocol, length: %d bytes", cmd_len);
+                LOG_HEXDUMP_INF(time_cmd, cmd_len, "Formatted time data command");
+                submit_command(time_cmd, cmd_len);
+            } else {
+                LOG_ERR("Failed to format time data command: %d", cmd_len);
+                
+                /* Fall back to old format for backward compatibility */
+                uint8_t old_time_cmd[] = {
+                    MSG_COMMAND_BYTE_START,  /* Start byte */
+                    MSG_COMMAND_MSG_COLON,   /* Command separator */
+                    CMD_COMMAND_TIMEDATA,    /* Time data command */
+                    MSG_COMMAND_MSG_COLON,   /* Data separator */
+                    '2', '0', '2', '5', '0', '5', '0', '6', '1', '5', '0', '7', '2', '2', /* Time data */
+                    MSG_COMMAND_MSG_END      /* End byte */
+                };
+                
+                submit_command(old_time_cmd, sizeof(old_time_cmd));
+            }
+            
             sent_time = true;
         }
         
