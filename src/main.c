@@ -586,9 +586,10 @@ static void notify_timer_handler(struct k_timer *timer)
                     last_sent_time = now;
                     notification_support.heartbeat_works = true;
                 } else if (err == -ENOTSUP) {
-                    /* This iOS client doesn't support heartbeat notifications */
+                    /* This iOS client doesn't support heartbeat notifications - disable permanently */
                     notification_support.heartbeat_works = false;
-                    LOG_INF("Heartbeat notifications disabled - not supported by client");
+                    last_heartbeat_attempt = UINT32_MAX/2; /* Effectively disable future attempts */
+                    LOG_WRN("Heartbeat notifications DISABLED - not supported by client");
                 } else if (err != -ENOTCONN) {
                     /* Log other non-connection errors */
                     LOG_ERR("Periodic notification failed (err %d)", err);
@@ -901,11 +902,13 @@ static void led_timer_handler(struct k_timer *timer)
     if (is_cpr_session_active()) {
         uint32_t elapsed_seconds = get_cpr_session_time();
         
-        /* Log CPR session time every 5 seconds */
-        if (elapsed_seconds % 5 == 0 && elapsed_seconds > 0) {
+        /* Log CPR session time less frequently and at debug level */
+        static uint32_t last_logged_time = 0;
+        if (elapsed_seconds % 10 == 0 && elapsed_seconds > 0 && elapsed_seconds != last_logged_time) {
+            last_logged_time = elapsed_seconds;
             uint32_t minutes = elapsed_seconds / 60;
             uint32_t seconds = elapsed_seconds % 60;
-            LOG_INF("CPR Session Time: %02d:%02d (elapsed seconds: %u)", 
+            LOG_DBG("CPR Session Time: %02d:%02d (elapsed seconds: %u)", 
                    minutes, seconds, elapsed_seconds);
             
             /* If notifications are enabled or CPR notifications allowed, and we have a valid, ready connection */
@@ -1010,7 +1013,14 @@ static void led_timer_handler(struct k_timer *timer)
                 }
             }
         } else {
-            LOG_INF("BLE notifications not enabled, no state notification sent");
+            /* Only log notification state issues occasionally to reduce log spam */
+            static uint32_t last_notif_warning = 0;
+            uint32_t now_warn = k_uptime_get_32();
+            
+            if (now_warn - last_notif_warning > 30000) { /* Only log every 30 seconds */
+                last_notif_warning = now_warn;
+                LOG_DBG("BLE notifications not enabled, no state notification sent");
+            }
             last_notified_state = cpr_session_active;  /* Update even if no notification is sent */
         }
     }
@@ -1146,9 +1156,10 @@ static void led_timer_handler(struct k_timer *timer)
                         LOG_INF("User role notification sent: role=%d, id=%s", role, id_buffer);
                         notification_support.role_works = true;
                     } else if (err == -ENOTSUP) {
-                        /* This iOS client doesn't support role notifications, turn them off */
+                        /* This iOS client doesn't support role notifications - disable permanently */
                         notification_support.role_works = false;
-                        LOG_INF("User role notifications disabled - not supported by client");
+                        last_role_attempt = UINT32_MAX/2; /* Effectively disable future attempts */
+                        LOG_WRN("User role notifications DISABLED - not supported by client");
                     } else if (err != -ENOTCONN) {
                         /* Log other non-connection errors */
                         LOG_ERR("User role notification failed (err %d)", err);
@@ -1184,9 +1195,10 @@ static void led_timer_handler(struct k_timer *timer)
                         LOG_INF("Time data notification sent: %s", time_buffer);
                         notification_support.time_works = true;
                     } else if (err == -ENOTSUP) {
-                        /* This iOS client doesn't support time data notifications, turn them off */
+                        /* This iOS client doesn't support time data notifications - disable permanently */
                         notification_support.time_works = false;
-                        LOG_INF("Time data notifications disabled - not supported by client");
+                        last_attempt_time = UINT32_MAX/2; /* Effectively disable future attempts */
+                        LOG_WRN("Time data notifications DISABLED - not supported by client");
                     } else if (err != -ENOTCONN) {
                         /* Log other non-connection errors */
                         LOG_ERR("Time data notification failed (err %d)", err);
@@ -1271,9 +1283,10 @@ int main(void)
     LOG_INF("Testing BLE protocol formatting");
     test_ble_protocol();
     
-    /* Test CPR session commands */
+    /* Test CPR session commands - only run if ENABLE_CPR_TEST is defined */
     k_sleep(K_SECONDS(2));
     
+#ifdef ENABLE_CPR_TEST
     LOG_INF("Sending CPR START command to message processor");
     submit_direct_command(CPR_CONTROL_START);
     
@@ -1281,6 +1294,9 @@ int main(void)
     
     LOG_INF("Sending CPR STOP command to message processor");
     submit_direct_command(CPR_COMMAND_STOP);
+#else
+    LOG_INF("CPR auto-test disabled - define ENABLE_CPR_TEST to enable");
+#endif
     
     /* Direct LED control test for verification */
     k_sleep(K_SECONDS(2));
@@ -1322,32 +1338,55 @@ int main(void)
         }
         
         /* Now get and display formatted RTC time */
-        size_t rtc_len = get_rtc_time(rtc_time, sizeof(rtc_time));
-        if (rtc_len > 0) {
-            LOG_INF("====== CURRENT TIME: %s ======", rtc_time);
-        } else {
-            LOG_INF("====== RTC TIME NOT AVAILABLE ======");
+        /* Log RTC time only occasionally */
+        static uint32_t last_rtc_log = 0;
+        uint32_t now_rtc = k_uptime_get_32();
+        
+        if (now_rtc - last_rtc_log >= 30000) { /* Only log every 30 seconds */
+            last_rtc_log = now_rtc;
+            
+            size_t rtc_len = get_rtc_time(rtc_time, sizeof(rtc_time));
+            if (rtc_len > 0) {
+                LOG_INF("====== CURRENT TIME: %s ======", rtc_time);
+            } else {
+                LOG_INF("====== RTC TIME NOT AVAILABLE ======");
+            }
         }
         
         /* Get user role information */
         uint8_t role = get_user_role();
         if (role != USER_ROLE_NONE) {
             char id_buffer[20] = {0};
-            if (role == USER_ROLE_INSTRUCTOR) {
-                get_instructor_id(id_buffer, sizeof(id_buffer));
-                LOG_INF("Heartbeat - Role: Instructor, ID: %s", id_buffer);
-            } else if (role == USER_ROLE_TRAINEE) {
-                get_trainee_id(id_buffer, sizeof(id_buffer));
-                LOG_INF("Heartbeat - Role: Trainee, ID: %s", id_buffer);
+            /* Log user role information less frequently */
+            static uint32_t last_role_info_log = 0;
+            uint32_t now_role = k_uptime_get_32();
+            
+            if (now_role - last_role_info_log >= 30000) { /* Only log every 30 seconds */
+                last_role_info_log = now_role;
+                
+                if (role == USER_ROLE_INSTRUCTOR) {
+                    get_instructor_id(id_buffer, sizeof(id_buffer));
+                    LOG_INF("Heartbeat - Role: Instructor, ID: %s", id_buffer);
+                } else if (role == USER_ROLE_TRAINEE) {
+                    get_trainee_id(id_buffer, sizeof(id_buffer));
+                    LOG_INF("Heartbeat - Role: Trainee, ID: %s", id_buffer);
+                }
             }
         } else {
-            LOG_INF("Heartbeat - No user role set");
+            /* Log lack of user role less frequently */
+            static uint32_t last_no_role_log = 0;
+            uint32_t now_no_role = k_uptime_get_32();
+            
+            if (now_no_role - last_no_role_log >= 30000) { /* Only log every 30 seconds */
+                last_no_role_log = now_no_role;
+                LOG_INF("Heartbeat - No user role set");
+            }
         }
         
-        /* Periodically display CPR session state - only log every 5 seconds to reduce noise */
+        /* Periodically display CPR session state - only log every 15 seconds to reduce noise */
         static uint32_t last_cpr_log_time = 0;
         uint32_t now = k_uptime_get_32();
-        if (now - last_cpr_log_time >= 5000) {
+        if (now - last_cpr_log_time >= 15000) {
             last_cpr_log_time = now;
             
             if (cpr_session_active) {
@@ -1358,7 +1397,7 @@ int main(void)
                     
                 LOG_INF("****** CPR SESSION ACTIVE - %02d:%02d elapsed ******", minutes, seconds);
             } else {
-                LOG_INF("------ No CPR session active ------");
+                LOG_DBG("------ No CPR session active ------");
             }
         }
         
