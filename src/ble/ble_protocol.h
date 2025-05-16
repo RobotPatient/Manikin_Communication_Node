@@ -8,7 +8,7 @@
 #include <zephyr/kernel.h>
 #include <stdint.h>
 #include <string.h>
-#include <zephyr/sys/types.h>
+#include <errno.h>
 #include "../ble_notifications.h"
 #include "crc/crc16_koopman.h"
 

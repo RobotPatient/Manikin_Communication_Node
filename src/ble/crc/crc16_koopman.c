@@ -89,7 +89,6 @@ uint16_t crc16_koopman_update(uint16_t crc, const uint8_t *data, size_t length) 
 uint16_t crc16_koopman_bit_by_bit(const uint8_t *data, size_t length) {
     uint16_t crc = 0;
     size_t i, j;
-    uint8_t bit;
 
     for (i = 0; i < length; i++) {
         crc ^= (data[i] << 8);
