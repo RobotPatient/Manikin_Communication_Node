@@ -718,7 +718,7 @@ static void advertising_work_handler(struct k_work *work)
     
     /* Define advertising parameters with higher reliability */
     static const struct bt_le_adv_param param = {
-        .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_ONE_TIME,  /* Connectable and one-time flag */
+        .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_IDENTITY,  /* Connectable with identity address */
         .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,  /* Use faster interval for better response */
         .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
         .id = BT_ID_DEFAULT,
@@ -1437,7 +1437,7 @@ int main(void)
             uint8_t time_cmd[32];
             
             int cmd_len = format_timedata_command(time_cmd, sizeof(time_cmd), 
-                                                time_data, strlen(time_data));
+                                                time_data, strlen(time_data), true);
             
             if (cmd_len > 0) {
                 LOG_INF("Formatted time data command using protocol, length: %d bytes", cmd_len);
