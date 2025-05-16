@@ -11,7 +11,6 @@
 #include "message_processor/message_processor.h"
 #include "ble/led_svc.h"
 #include "ble/ble_protocol.h"
-#include "ble/crc/crc16_koopman.h"
 #include "ble_notifications.h"
 
 /* External declaration for protocol test function */

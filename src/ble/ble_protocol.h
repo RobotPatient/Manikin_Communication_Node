@@ -8,7 +8,7 @@
 #include <zephyr/kernel.h>
 #include <stdint.h>
 #include <string.h>
-#include <errno.h>
+#include <zephyr/sys/errno.h>
 #include "../ble_notifications.h"
 #include "crc/crc16_koopman.h"
 
@@ -219,8 +219,24 @@ static inline bool verify_ble_message_crc(const uint8_t *buffer, size_t length)
         return true;
     }
     
+    /* Verify message format is valid */
+    if (length < 4 || buffer[2] != BLE_COMMAND_MSG_COLON) {
+        return false;
+    }
+    
+    /* Make sure the length is as expected */
+    if (length != (size_t)(msg_len + 5)) { /* START + LEN + COLON + MSG_LEN + SEMICOLON + END */
+        return false;
+    }
+    
     /* Calculate CRC on the message excluding the CRC bytes, SEMICOLON, and END_BYTE */
     size_t crc_data_len = length - 4; /* Exclude CRC(2) + SEMICOLON + END */
+    
+    /* Sanity check the calculated length */
+    if (crc_data_len < 4 || crc_data_len >= length) {
+        return false;
+    }
+    
     uint16_t calculated_crc = crc16_koopman(buffer, crc_data_len);
     
     /* Extract received CRC (big endian) */
