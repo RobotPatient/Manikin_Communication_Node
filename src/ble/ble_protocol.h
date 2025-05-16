@@ -8,9 +8,18 @@
 #include <zephyr/kernel.h>
 #include <stdint.h>
 #include <string.h>
-#include <zephyr/sys/errno.h>
+#include <errno.h>
 #include "../ble_notifications.h"
 #include "crc/crc16_koopman.h"
+
+/* Define our own error constants in case errno.h doesn't provide them */
+#ifndef EINVAL
+#define EINVAL 22  /* Invalid argument */
+#endif
+
+#ifndef ENOMEM
+#define ENOMEM 12   /* Out of memory */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
