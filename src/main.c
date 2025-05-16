@@ -32,6 +32,10 @@ uint32_t connection_ready_delay = 3000;  /* Delay in ms before sending notificat
 /* Global notification buffer and state */
 static uint8_t notify_buffer[128] = {0}; /* Increased buffer size for protocol format with CRC */
 
+/* Global BLE notification error tracking */
+static uint32_t g_last_enomem_time = 0;
+static uint8_t g_enomem_count = 0;
+
 /* Forward declarations for CPR session management */
 bool is_cpr_session_active(void);
 void start_cpr_session(void);
@@ -158,10 +162,6 @@ static int send_notification_safely(const void *data, uint16_t len) {
     static uint32_t last_notification_time = 0;
     static const uint32_t MIN_NOTIFICATION_INTERVAL = 200; /* Min 200ms between notifications for STM32H7 */
     
-    /* Check if we hit ENOMEM errors frequently */
-    static uint32_t last_enomem_time = 0;
-    static uint8_t enomem_count = 0;
-    
     /* We need extern declaration for custom_svc which is defined by BT_GATT_SERVICE_DEFINE macro */
     extern const struct bt_gatt_service_static custom_svc;
     
@@ -192,10 +192,10 @@ static int send_notification_safely(const void *data, uint16_t len) {
     }
     
     /* If we've seen multiple ENOMEM errors recently, add more backoff */
-    if (enomem_count > 3 && (now - last_enomem_time < 2000)) {
-        LOG_WRN("Adding extra backoff due to %d recent ENOMEM errors", enomem_count);
+    if (g_enomem_count > 3 && (now - g_last_enomem_time < 2000)) {
+        LOG_WRN("Adding extra backoff due to %d recent ENOMEM errors", g_enomem_count);
         /* Increase backoff time based on error count */
-        uint32_t extra_delay = MIN_NOTIFICATION_INTERVAL * enomem_count;
+        uint32_t extra_delay = MIN_NOTIFICATION_INTERVAL * g_enomem_count;
         if (now - last_notification_time < extra_delay) {
             return -EAGAIN;
         }
@@ -210,8 +210,8 @@ static int send_notification_safely(const void *data, uint16_t len) {
         last_notification_time = now;
         
         /* If successful, gradually reset the ENOMEM counter */
-        if (enomem_count > 0 && (now - last_enomem_time > 5000)) {
-            enomem_count--;
+        if (g_enomem_count > 0 && (now - g_last_enomem_time > 5000)) {
+            g_enomem_count--;
         }
     }
     
@@ -264,16 +264,16 @@ static int send_notification_safely(const void *data, uint16_t len) {
             }
             
             /* Track ENOMEM errors to implement dynamic backoff */
-            last_enomem_time = now_err;
-            if (enomem_count < 10) {
-                enomem_count++;
+            g_last_enomem_time = now_err;
+            if (g_enomem_count < 10) {
+                g_enomem_count++;
             }
             
             /* Increase backoff time based on error count */
-            uint32_t backoff = 250 + (enomem_count * 50); /* 250-750ms backoff */
+            uint32_t backoff = 250 + (g_enomem_count * 50); /* 250-750ms backoff */
             last_notification_time = now + backoff;
             
-            LOG_DBG("Adding %u ms backoff after ENOMEM (count: %u)", backoff, enomem_count);
+            LOG_DBG("Adding %u ms backoff after ENOMEM (count: %u)", backoff, g_enomem_count);
         }
         else if (err == -BT_ATT_ERR_UNLIKELY || err == -ENOTCONN) {
             /* Only log connection resets occasionally */
@@ -407,9 +407,9 @@ void stop_cpr_session(void)
     cpr_session_start_time = 0;
     
     /* Clear any pending notification errors to ensure stop notification gets through */
-    if (enomem_count > 0) {
+    if (g_enomem_count > 0) {
         LOG_INF("Clearing notification error state for clean session stop");
-        enomem_count = 0;
+        g_enomem_count = 0;
     }
     
     /* Store elapsed time for notification via timer handler */
@@ -1046,8 +1046,8 @@ static void led_timer_handler(struct k_timer *timer)
                 }
                 
                 /* Clear any pending notification errors for critical notification */
-                if (enomem_count > 0) {
-                    enomem_count = 0;
+                if (g_enomem_count > 0) {
+                    g_enomem_count = 0;
                 }
                 
                 int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
@@ -1087,8 +1087,8 @@ static void led_timer_handler(struct k_timer *timer)
                 }
                 
                 /* Clear any pending notification errors for critical notification */
-                if (enomem_count > 0) {
-                    enomem_count = 0;
+                if (g_enomem_count > 0) {
+                    g_enomem_count = 0;
                 }
                 
                 int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
@@ -1191,9 +1191,9 @@ static void led_timer_handler(struct k_timer *timer)
             }
             
             /* Clear any pending notification errors for this critical notification */
-            if (enomem_count > 0) {
+            if (g_enomem_count > 0) {
                 LOG_INF("Clearing error state for CPR STOP acknowledgment");
-                enomem_count = 0;
+                g_enomem_count = 0;
             }
             
             /* Prepare a payload with command details, duration, and formatted time */
