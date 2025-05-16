@@ -27,10 +27,10 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 struct bt_conn *current_conn = NULL;
 bool is_connected = false;
 uint32_t connection_time = 0;   /* Time when connection was established */
-uint32_t connection_ready_delay = 2000;  /* Delay in ms before sending notifications */
+uint32_t connection_ready_delay = 3000;  /* Delay in ms before sending notifications */
 
 /* Global notification buffer and state */
-static uint8_t notify_buffer[64] = {0}; /* Increased from 20 to 64 bytes to accommodate protocol format */
+static uint8_t notify_buffer[128] = {0}; /* Increased buffer size for protocol format with CRC */
 
 /* Forward declarations for CPR session management */
 bool is_cpr_session_active(void);
@@ -156,7 +156,11 @@ static int send_notification_safely(const void *data, uint16_t len) {
     
     /* Rate limiter for notifications to prevent buffer overflow */
     static uint32_t last_notification_time = 0;
-    static const uint32_t MIN_NOTIFICATION_INTERVAL = 100; /* Min 100ms between notifications for STM32H7 */
+    static const uint32_t MIN_NOTIFICATION_INTERVAL = 200; /* Min 200ms between notifications for STM32H7 */
+    
+    /* Check if we hit ENOMEM errors frequently */
+    static uint32_t last_enomem_time = 0;
+    static uint8_t enomem_count = 0;
     
     /* We need extern declaration for custom_svc which is defined by BT_GATT_SERVICE_DEFINE macro */
     extern const struct bt_gatt_service_static custom_svc;
@@ -187,13 +191,28 @@ static int send_notification_safely(const void *data, uint16_t len) {
         return -EAGAIN;
     }
     
+    /* If we've seen multiple ENOMEM errors recently, add more backoff */
+    if (enomem_count > 3 && (now - last_enomem_time < 2000)) {
+        LOG_WRN("Adding extra backoff due to %d recent ENOMEM errors", enomem_count);
+        /* Increase backoff time based on error count */
+        uint32_t extra_delay = MIN_NOTIFICATION_INTERVAL * enomem_count;
+        if (now - last_notification_time < extra_delay) {
+            return -EAGAIN;
+        }
+    }
+    
     /* Try to send the notification */
     LOG_DBG("Sending notification: len=%d using attr[%d]", len, NOTIFY_CHAR_INDEX);
     int err = bt_gatt_notify(NULL, &custom_svc.attrs[NOTIFY_CHAR_INDEX], data, len);
     
-    /* Update last notification time if successful or if we encountered buffer issues */
-    if (err == 0 || err == -ENOMEM) {
+    /* Update last notification time if successful */
+    if (err == 0) {
         last_notification_time = now;
+        
+        /* If successful, gradually reset the ENOMEM counter */
+        if (enomem_count > 0 && (now - last_enomem_time > 5000)) {
+            enomem_count--;
+        }
     }
     
     /* Handle any errors */
@@ -240,11 +259,21 @@ static int send_notification_safely(const void *data, uint16_t len) {
             /* With ACL flow control, this is likely temporary buffer exhaustion - add more backoff */
             static uint32_t last_backoff_time = 0;
             if (now_err - last_backoff_time > 2000) {
-                LOG_WRN("BLE stack buffer full (-ENOMEM), adding 250ms backoff");
+                LOG_WRN("BLE stack buffer full (-ENOMEM), adding dynamic backoff");
                 last_backoff_time = now_err;
             }
-            /* Increase backoff time to 250ms to allow stack to recover */
-            last_notification_time = now + 200;
+            
+            /* Track ENOMEM errors to implement dynamic backoff */
+            last_enomem_time = now_err;
+            if (enomem_count < 10) {
+                enomem_count++;
+            }
+            
+            /* Increase backoff time based on error count */
+            uint32_t backoff = 250 + (enomem_count * 50); /* 250-750ms backoff */
+            last_notification_time = now + backoff;
+            
+            LOG_DBG("Adding %u ms backoff after ENOMEM (count: %u)", backoff, enomem_count);
         }
         else if (err == -BT_ATT_ERR_UNLIKELY || err == -ENOTCONN) {
             /* Only log connection resets occasionally */
@@ -376,6 +405,12 @@ void stop_cpr_session(void)
     /* Reset session state */
     cpr_session_active = false;
     cpr_session_start_time = 0;
+    
+    /* Clear any pending notification errors to ensure stop notification gets through */
+    if (enomem_count > 0) {
+        LOG_INF("Clearing notification error state for clean session stop");
+        enomem_count = 0;
+    }
     
     /* Store elapsed time for notification via timer handler */
     LOG_INF("CPR session stop: Notification with duration %u seconds will be sent via timer handler", elapsed_sec);
@@ -1000,14 +1035,40 @@ static void led_timer_handler(struct k_timer *timer)
                 /* Just need to send a single byte with state value */
                 uint8_t state = 0x01;  /* State: Active */
                 
+                /* Use our adaptive retry mechanism for critical state changes */
+                static uint32_t last_retry_time = 0;
+                static uint8_t retry_count = 0;
+                uint32_t now_retry = k_uptime_get_32();
+                
+                /* Reset retry count if it's been a while */
+                if (now_retry - last_retry_time > 5000) {
+                    retry_count = 0;
+                }
+                
+                /* Clear any pending notification errors for critical notification */
+                if (enomem_count > 0) {
+                    enomem_count = 0;
+                }
+                
                 int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
                 
                 /* Only log success or non-connection errors */
                 if (err == 0) {
                     LOG_INF("CPR session ACTIVE state notification sent successfully");
                     last_notified_state = cpr_session_active;  /* Update notified state */
-                } else if (err != -ENOTCONN && err != -ENOTSUP) {
-                    /* We don't log connection errors because they're expected when no device is connected */
+                    retry_count = 0; /* Reset retry count on success */
+                } else if (err == -ENOMEM) {
+                    /* Special handling for memory errors - retry with backoff */
+                    if (retry_count < 5) {
+                        retry_count++;
+                        last_retry_time = now_retry;
+                        LOG_WRN("ENOMEM on critical CPR state notification, will retry (attempt %u/5)", retry_count);
+                    } else {
+                        LOG_ERR("Failed to send CPR ACTIVE state after multiple retries");
+                        last_notified_state = cpr_session_active; /* Give up after 5 retries */
+                    }
+                } else if (err != -ENOTCONN && err != -ENOTSUP && err != -EAGAIN) {
+                    /* Log other errors but don't retry */
                     LOG_ERR("CPR session ACTIVE state notification failed (err %d)", err);
                     /* Don't update state so we'll try again next time */
                 }
@@ -1015,14 +1076,40 @@ static void led_timer_handler(struct k_timer *timer)
                 /* Just need to send a single byte with state value */
                 uint8_t state = 0x00;  /* State: Inactive */
                 
+                /* Use our adaptive retry mechanism for critical state changes */
+                static uint32_t last_retry_time = 0;
+                static uint8_t retry_count = 0;
+                uint32_t now_retry = k_uptime_get_32();
+                
+                /* Reset retry count if it's been a while */
+                if (now_retry - last_retry_time > 5000) {
+                    retry_count = 0;
+                }
+                
+                /* Clear any pending notification errors for critical notification */
+                if (enomem_count > 0) {
+                    enomem_count = 0;
+                }
+                
                 int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
                 
                 /* Only log success or non-connection errors */
                 if (err == 0) {
                     LOG_INF("CPR session INACTIVE state notification sent successfully");
                     last_notified_state = cpr_session_active;  /* Update notified state */
-                } else if (err != -ENOTCONN && err != -ENOTSUP) {
-                    /* We don't log connection errors because they're expected when no device is connected */
+                    retry_count = 0; /* Reset retry count on success */
+                } else if (err == -ENOMEM) {
+                    /* Special handling for memory errors - retry with backoff */
+                    if (retry_count < 5) {
+                        retry_count++;
+                        last_retry_time = now_retry;
+                        LOG_WRN("ENOMEM on critical CPR state notification, will retry (attempt %u/5)", retry_count);
+                    } else {
+                        LOG_ERR("Failed to send CPR INACTIVE state after multiple retries");
+                        last_notified_state = cpr_session_active; /* Give up after 5 retries */
+                    }
+                } else if (err != -ENOTCONN && err != -ENOTSUP && err != -EAGAIN) {
+                    /* Log other errors but don't retry */
                     LOG_ERR("CPR session INACTIVE state notification failed (err %d)", err);
                     /* Don't update state so we'll try again next time */
                 }
@@ -1093,6 +1180,22 @@ static void led_timer_handler(struct k_timer *timer)
             uint32_t minutes = elapsed_sec / 60;
             uint32_t seconds = elapsed_sec % 60;
             
+            /* Track retry attempts for this critical notification */
+            static uint32_t last_stop_retry_time = 0;
+            static uint8_t stop_retry_count = 0;
+            uint32_t now_stop_retry = k_uptime_get_32();
+            
+            /* Reset retry tracking if it's been a while */
+            if (now_stop_retry - last_stop_retry_time > 5000) {
+                stop_retry_count = 0;
+            }
+            
+            /* Clear any pending notification errors for this critical notification */
+            if (enomem_count > 0) {
+                LOG_INF("Clearing error state for CPR STOP acknowledgment");
+                enomem_count = 0;
+            }
+            
             /* Prepare a payload with command details, duration, and formatted time */
             uint8_t payload[32]; /* Increased size to handle protocol overhead */
             
@@ -1119,8 +1222,21 @@ static void led_timer_handler(struct k_timer *timer)
                 LOG_INF("CPR STOP command acknowledgment sent: OK with time %s (%u seconds)", 
                         time_str, elapsed_sec);
                 stop_ack_sent = true;
-            } else if (err != -ENOTCONN && err != -ENOTSUP) {
-                /* We don't log connection errors because they're expected when no device is connected */
+                stop_retry_count = 0; /* Reset retry count on success */
+            } else if (err == -ENOMEM) {
+                /* Special handling for memory errors - retry with backoff */
+                if (stop_retry_count < 5) {
+                    stop_retry_count++;
+                    last_stop_retry_time = now_stop_retry;
+                    LOG_WRN("ENOMEM on critical CPR STOP acknowledgment, will retry (attempt %u/5)", stop_retry_count);
+                    /* Small delay to avoid immediate retry */
+                    k_sleep(K_MSEC(50 * stop_retry_count)); 
+                } else {
+                    LOG_ERR("Failed to send CPR STOP acknowledgment after multiple retries");
+                    stop_ack_sent = true; /* Give up after 5 retries */
+                }
+            } else if (err != -ENOTCONN && err != -ENOTSUP && err != -EAGAIN) {
+                /* Log other errors but don't retry */
                 LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
                 /* Don't mark as sent so we'll retry later */
             }
