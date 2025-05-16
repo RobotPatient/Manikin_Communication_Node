@@ -11,6 +11,7 @@ project(st_ble_sensor)
 zephyr_include_directories(
     src
     src/ble
+    src/ble/crc
     src/message_processor
 )
 
@@ -23,6 +24,7 @@ target_sources(app PRIVATE
   src/message_processor/message_processor_simple.c
   src/ble/led_svc.c
   src/ble/ble_protocol.c
+  src/ble/crc/crc16_koopman.c
   )
 
 # Add Bluetooth sample includes for reference

@@ -7,7 +7,7 @@ This document specifies the Bluetooth Low Energy (BLE) communication protocol be
 All commands and responses follow a standardized format:
 
 ```
-START_BYTE + LENGTH_BYTE + COLON + MESSAGE + SEMICOLON + END_BYTE
+START_BYTE + LENGTH_BYTE + COLON + MESSAGE + CRC16 + SEMICOLON + END_BYTE
 ```
 
 ### Protocol Constants
@@ -22,9 +22,10 @@ START_BYTE + LENGTH_BYTE + COLON + MESSAGE + SEMICOLON + END_BYTE
 ### Message Structure
 
 * **START_BYTE**: Always `0x01`
-* **LENGTH_BYTE**: Length of the MESSAGE content (1 byte)
+* **LENGTH_BYTE**: Length of the MESSAGE content + CRC (in bytes)
 * **COLON**: Always `0x3A`
 * **MESSAGE**: Command byte + optional payload
+* **CRC16**: 16-bit CRC-16 Koopman Polynomial (0x8D95) of all preceding bytes
 * **SEMICOLON**: Always `0x3B`
 * **END_BYTE**: Always `0x17`
 
@@ -40,28 +41,28 @@ To start a CPR session, the iOS app sends a sequence of 4 commands in order:
 ```
 Command: CMD_COMMAND_DATA (0x04)
 Payload: Instructor ID data
-Format: 0x01 + [LENGTH] + 0x3A + 0x04 + [INSTRUCTOR_ID] + 0x3B + 0x17
+Format: 0x01 + [LENGTH] + 0x3A + 0x04 + [INSTRUCTOR_ID] + [CRC16] + 0x3B + 0x17
 ```
 
 **Send Trainee ID**
 ```
 Command: CMD_COMMAND_DATA (0x04)
 Payload: Trainee ID data
-Format: 0x01 + [LENGTH] + 0x3A + 0x04 + [TRAINEE_ID] + 0x3B + 0x17
+Format: 0x01 + [LENGTH] + 0x3A + 0x04 + [TRAINEE_ID] + [CRC16] + 0x3B + 0x17
 ```
 
 **Send Date/Time**
 ```
 Command: CMD_COMMAND_TIMEDATA (0x05)
 Payload: Date/time data
-Format: 0x01 + [LENGTH] + 0x3A + 0x05 + [DATETIME] + 0x3B + 0x17
+Format: 0x01 + [LENGTH] + 0x3A + 0x05 + [DATETIME] + [CRC16] + 0x3B + 0x17
 ```
 
 **Start CPR Command**
 ```
 Command: CPR_CONTROL_START (0x02)
 Payload: None
-Format: 0x01 + 0x01 + 0x3A + 0x02 + 0x3B + 0x17
+Format: 0x01 + 0x03 + 0x3A + 0x02 + [CRC16] + 0x3B + 0x17
 ```
 
 #### Stop CPR Session
@@ -70,7 +71,7 @@ Format: 0x01 + 0x01 + 0x3A + 0x02 + 0x3B + 0x17
 ```
 Command: CPR_COMMAND_STOP (0x03)
 Payload: None
-Format: 0x01 + 0x01 + 0x3A + 0x03 + 0x3B + 0x17
+Format: 0x01 + 0x03 + 0x3A + 0x03 + [CRC16] + 0x3B + 0x17
 ```
 
 ### Command Reference
@@ -89,17 +90,17 @@ Format: 0x01 + 0x01 + 0x3A + 0x03 + 0x3B + 0x17
 The manikin acknowledges each command by echoing back the same command value:
 
 ```
-Format: 0x01 + 0x01 + 0x3A + [COMMAND_BYTE] + 0x3B + 0x17
+Format: 0x01 + 0x03 + 0x3A + [COMMAND_BYTE] + [CRC16] + 0x3B + 0x17
 ```
 
 #### Expected Acknowledgments
 
 | Original Command | Expected Response | iOS Action |
 | --- | --- | --- |
-| `CPR_CONTROL_START (0x02)` | `0x01 0x01 0x3A 0x02 0x3B 0x17` | Set `isCPRStartAcknowledged = true`, update UI |
-| `CPR_COMMAND_STOP (0x03)` | `0x01 0x01 0x3A 0x03 0x3B 0x17` | Set `isCPRStopAcknowledged = true`, reset session |
-| `CMD_COMMAND_DATA (0x04)` | `0x01 0x01 0x3A 0x04 0x3B 0x17` | Acknowledge ID data received |
-| `CMD_COMMAND_TIMEDATA (0x05)` | `0x01 0x01 0x3A 0x05 0x3B 0x17` | Acknowledge date/time received |
+| `CPR_CONTROL_START (0x02)` | `0x01 0x03 0x3A 0x02 [CRC16] 0x3B 0x17` | Set `isCPRStartAcknowledged = true`, update UI |
+| `CPR_COMMAND_STOP (0x03)` | `0x01 0x03 0x3A 0x03 [CRC16] 0x3B 0x17` | Set `isCPRStopAcknowledged = true`, reset session |
+| `CMD_COMMAND_DATA (0x04)` | `0x01 0x03 0x3A 0x04 [CRC16] 0x3B 0x17` | Acknowledge ID data received |
+| `CMD_COMMAND_TIMEDATA (0x05)` | `0x01 0x03 0x3A 0x05 [CRC16] 0x3B 0x17` | Acknowledge date/time received |
 
 ### Heartbeat Messages
 
@@ -167,19 +168,21 @@ Manikin → iOS: ACK Stop CPR (0x03)
 The iOS app validates received BLE data through:
 1. **Message Format Validation**: Verify protocol structure
 2. **Command Extraction**: Parse command byte and payload
-3. **Acknowledgment Matching**: Check against expected responses
+3. **CRC Validation**: Verify CRC-16 checksum for data integrity
+4. **Acknowledgment Matching**: Check against expected responses
 
 ## Example Messages
 
 ### Start CPR Command (No Payload)
 
 ```
-Hex: 0x01 0x01 0x3A 0x02 0x3B 0x17
+Hex: 0x01 0x03 0x3A 0x02 0xXX 0xXX 0x3B 0x17
 Breakdown:
 0x01: START_BYTE
-0x01: LENGTH_BYTE (1 byte message)
+0x03: LENGTH_BYTE (1 byte message + 2 byte CRC)
 0x3A: COLON
 0x02: CPR_CONTROL_START command
+0xXX 0xXX: CRC-16 value (calculated)
 0x3B: SEMICOLON
 0x17: END_BYTE
 ```
@@ -187,12 +190,13 @@ Breakdown:
 ### Stop CPR Command (No Payload)
 
 ```
-Hex: 0x01 0x01 0x3A 0x03 0x3B 0x17
+Hex: 0x01 0x03 0x3A 0x03 0xXX 0xXX 0x3B 0x17
 Breakdown:
 0x01: START_BYTE
-0x01: LENGTH_BYTE (1 byte message)
+0x03: LENGTH_BYTE (1 byte message + 2 byte CRC)
 0x3A: COLON
 0x03: CPR_COMMAND_STOP command
+0xXX 0xXX: CRC-16 value (calculated)
 0x3B: SEMICOLON
 0x17: END_BYTE
 ```
@@ -211,3 +215,16 @@ Breakdown:
 * Validate all incoming data to prevent buffer overflows
 * Implement rate limiting to prevent spam commands
 * Secure storage of user IDs and session data
+* Verify CRC-16 checksums to ensure data integrity
+
+## CRC-16 Implementation
+
+The CRC-16 is calculated using the Koopman polynomial 0x8D95, which offers excellent error detection properties especially for small packets like those used in BLE communication.
+
+* **Polynomial**: 0x8D95 (Koopman)
+* **Initial Value**: 0x0000
+* **Input Reflection**: No
+* **Output Reflection**: No
+* **XOR Output**: 0x0000
+
+The CRC is calculated over all bytes from the START_BYTE up to but not including the CRC bytes themselves, and is inserted as a 2-byte value (MSB first) before the SEMICOLON.

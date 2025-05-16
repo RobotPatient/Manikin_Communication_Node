@@ -11,6 +11,7 @@
 #include "message_processor/message_processor.h"
 #include "ble/led_svc.h"
 #include "ble/ble_protocol.h"
+#include "ble/crc/crc16_koopman.h"
 #include "ble_notifications.h"
 
 /* External declaration for protocol test function */
@@ -59,10 +60,10 @@ static int send_notification_safely(const void *data, uint16_t len);
  */
 static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t payload_len) {
     /* Calculate the total required buffer size: 
-     * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + SEMICOLON(1) + END_BYTE(1)
-     * This is 6 bytes overhead plus payload_len: START + LEN + COLON + MSG_TYPE + SEMICOLON + END
+     * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + CRC(2) + SEMICOLON(1) + END_BYTE(1)
+     * This is 8 bytes overhead plus payload_len: START + LEN + COLON + MSG_TYPE + CRC(2) + SEMICOLON + END
      */
-    uint16_t total_len = 6 + payload_len; // 6 = START + LEN + COLON + MSG_TYPE + SEMICOLON + END
+    uint16_t total_len = 8 + payload_len; // 8 = START + LEN + COLON + MSG_TYPE + CRC(2) + SEMICOLON + END
     
     /* Check if we have space in buffer */
     if (total_len > sizeof(notify_buffer)) {
@@ -70,9 +71,9 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
         return -EINVAL;
     }
     
-    /* Format the notification according to protocol */
+    /* Format the notification according to protocol with CRC */
     notify_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
-    notify_buffer[1] = payload_len + 1;          /* LENGTH_BYTE - payload plus msg_type byte */
+    notify_buffer[1] = payload_len + 1 + 2;      /* LENGTH_BYTE - payload plus msg_type byte plus 2 CRC bytes */
     notify_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
     notify_buffer[3] = msg_type;                 /* Message type */
     
@@ -81,9 +82,16 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
         memcpy(&notify_buffer[4], payload, payload_len);
     }
     
+    /* Calculate CRC on everything from START to end of payload */
+    uint16_t crc = crc16_koopman(notify_buffer, 4 + payload_len);
+    
+    /* Add CRC bytes (MSB first) */
+    notify_buffer[4 + payload_len] = (uint8_t)(crc >> 8);        /* MSB of CRC */
+    notify_buffer[5 + payload_len] = (uint8_t)(crc & 0xFF);      /* LSB of CRC */
+    
     /* Add terminating bytes */
-    notify_buffer[4 + payload_len] = BLE_COMMAND_MSG_SEMICOLON; /* SEMICOLON */
-    notify_buffer[5 + payload_len] = BLE_COMMAND_MSG_END;       /* END_BYTE */
+    notify_buffer[6 + payload_len] = BLE_COMMAND_MSG_SEMICOLON; /* SEMICOLON */
+    notify_buffer[7 + payload_len] = BLE_COMMAND_MSG_END;       /* END_BYTE */
     
     /* Send notification */
     return send_notification_safely(notify_buffer, total_len);
@@ -98,15 +106,23 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
  * @return 0 on success, negative error code on failure
  */
 static int send_command_ack(uint8_t cmd_byte) {
-    /* Format according to protocol: START_BYTE + LENGTH_BYTE + COLON + CMD_BYTE + SEMICOLON + END_BYTE */
-    uint8_t ack_buffer[6];
+    /* Format according to protocol: START_BYTE + LENGTH_BYTE + COLON + CMD_BYTE + CRC(2) + SEMICOLON + END_BYTE */
+    uint8_t ack_buffer[8];
     
     ack_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
-    ack_buffer[1] = 0x01;                     /* LENGTH_BYTE - just the command byte */
+    ack_buffer[1] = 0x01 + 0x02;              /* LENGTH_BYTE - command byte + 2 CRC bytes */
     ack_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
     ack_buffer[3] = cmd_byte;                 /* Original command byte */
-    ack_buffer[4] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON */
-    ack_buffer[5] = BLE_COMMAND_MSG_END;      /* END_BYTE */
+    
+    /* Calculate CRC on everything from START to CMD_BYTE */
+    uint16_t crc = crc16_koopman(ack_buffer, 4);
+    
+    /* Add CRC bytes (MSB first) */
+    ack_buffer[4] = (uint8_t)(crc >> 8);      /* MSB of CRC */
+    ack_buffer[5] = (uint8_t)(crc & 0xFF);    /* LSB of CRC */
+    
+    ack_buffer[6] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON */
+    ack_buffer[7] = BLE_COMMAND_MSG_END;      /* END_BYTE */
     
     LOG_INF("Sending command acknowledgment for cmd: 0x%02x", cmd_byte);
     
