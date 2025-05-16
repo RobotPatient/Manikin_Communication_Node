@@ -36,6 +36,18 @@ static uint8_t notify_buffer[128] = {0}; /* Increased buffer size for protocol f
 static uint32_t g_last_enomem_time = 0;
 static uint8_t g_enomem_count = 0;
 
+/* Command acknowledgment queue for handling commands during connection setup */
+#define ACK_QUEUE_SIZE 8
+static struct {
+    uint8_t cmd_byte;
+    uint32_t timestamp;
+    bool used;
+} ack_queue[ACK_QUEUE_SIZE];
+static uint8_t ack_queue_count = 0;
+
+/* Timer for processing queued acknowledgments */
+static struct k_timer ack_timer;
+
 /* Forward declarations for CPR session management */
 bool is_cpr_session_active(void);
 void start_cpr_session(void);
@@ -44,6 +56,9 @@ uint32_t get_cpr_session_time(void);
 
 /* Forward declaration of our notification helper functions */
 static int send_notification_safely(const void *data, uint16_t len);
+static int send_command_ack(uint8_t cmd_byte);
+static void queue_command_ack(uint8_t cmd_byte);
+static void process_ack_queue(void);
 
 /* Helper function to prepare and send a notification using protocol format
  * 
@@ -100,6 +115,149 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
     return send_notification_safely(notify_buffer, total_len);
 }
 
+/* Function to add a command to the acknowledgment queue */
+static void queue_command_ack(uint8_t cmd_byte) {
+    /* Don't queue duplicates */
+    for (int i = 0; i < ACK_QUEUE_SIZE; i++) {
+        if (ack_queue[i].used && ack_queue[i].cmd_byte == cmd_byte) {
+            /* Just update the timestamp */
+            ack_queue[i].timestamp = k_uptime_get_32();
+            LOG_INF("Updated existing queued acknowledgment for cmd 0x%02x", cmd_byte);
+            return;
+        }
+    }
+    
+    /* Find an empty slot */
+    for (int i = 0; i < ACK_QUEUE_SIZE; i++) {
+        if (!ack_queue[i].used) {
+            ack_queue[i].cmd_byte = cmd_byte;
+            ack_queue[i].timestamp = k_uptime_get_32();
+            ack_queue[i].used = true;
+            ack_queue_count++;
+            LOG_INF("Queued acknowledgment for cmd 0x%02x (queue count: %d)", cmd_byte, ack_queue_count);
+            
+            /* Make sure timer is running with sufficient delay 
+             * Start the timer at slightly less than the connection ready delay
+             * to ensure we're ready to send right when the connection stabilizes */
+            k_timer_start(&ack_timer, 
+                         K_MSEC(connection_ready_delay/2),  /* First run at half the connection ready delay */
+                         K_MSEC(250));                      /* Check every 250ms after that */
+            return;
+        }
+    }
+    
+    /* If we get here, the queue is full */
+    LOG_WRN("Command acknowledgment queue full, dropping ack for cmd 0x%02x", cmd_byte);
+}
+
+/* Process any pending acknowledgments in the queue */
+static void process_ack_queue(void) {
+    /* Verify connection state at the beginning */
+    if (!is_connected || !current_conn) {
+        if (ack_queue_count > 0) {
+            LOG_INF("Connection lost, clearing acknowledgment queue (%d items)", ack_queue_count);
+            memset(ack_queue, 0, sizeof(ack_queue));
+            ack_queue_count = 0;
+            k_timer_stop(&ack_timer);
+        }
+        return;
+    }
+    
+    /* Exit if queue is empty */
+    if (ack_queue_count == 0) {
+        k_timer_stop(&ack_timer);
+        return;
+    }
+    
+    /* Check if connection is stable enough for notifications */
+    uint32_t now = k_uptime_get_32();
+    uint32_t conn_age = now - connection_time;
+    
+    if (conn_age < connection_ready_delay) {
+        /* Not ready yet, try again later */
+        static uint32_t last_wait_log = 0;
+        if (now - last_wait_log > 1000) {  /* Only log once per second */
+            LOG_DBG("Connection too fresh for queue processing (%u ms < %u ms), %d items pending",
+                   conn_age, connection_ready_delay, ack_queue_count);
+            last_wait_log = now;
+        }
+        return;
+    }
+    
+    LOG_INF("Processing acknowledgment queue (%d items)...", ack_queue_count);
+    
+    /* Verify connection state again just before processing items */
+    if (!is_connected || !current_conn) {
+        LOG_WRN("Connection lost before queue processing could start");
+        memset(ack_queue, 0, sizeof(ack_queue));
+        ack_queue_count = 0;
+        k_timer_stop(&ack_timer);
+        return;
+    }
+    
+    /* Process each item in the queue */
+    int successful_sends = 0;
+    
+    for (int i = 0; i < ACK_QUEUE_SIZE; i++) {
+        /* Verify connection is still active */
+        if (!is_connected || !current_conn) {
+            LOG_WRN("Connection lost during queue processing, stopping");
+            /* Clear remaining items */
+            memset(ack_queue, 0, sizeof(ack_queue));
+            ack_queue_count = 0;
+            k_timer_stop(&ack_timer);
+            return;
+        }
+        
+        if (ack_queue[i].used) {
+            LOG_INF("Sending queued acknowledgment for cmd 0x%02x", ack_queue[i].cmd_byte);
+            
+            int err = send_command_ack(ack_queue[i].cmd_byte);
+            
+            if (err == 0 || err == -ENOTSUP) {
+                /* Success or client doesn't support notifications - clear the slot */
+                LOG_INF("Successfully sent queued acknowledgment for cmd 0x%02x", ack_queue[i].cmd_byte);
+                ack_queue[i].used = false;
+                ack_queue_count--;
+                successful_sends++;
+                
+                /* Add a small delay between sends to avoid overwhelming the stack */
+                if (successful_sends > 0 && i < ACK_QUEUE_SIZE-1) {
+                    k_sleep(K_MSEC(50));
+                }
+            } else if (err == -ENOTCONN) {
+                /* Lost connection while processing queue */
+                LOG_WRN("Lost connection while processing acknowledgment queue");
+                /* Clear all queue items */
+                memset(ack_queue, 0, sizeof(ack_queue));
+                ack_queue_count = 0;
+                k_timer_stop(&ack_timer);
+                return;
+            } else if (err == -ENOMEM) {
+                /* Memory constraint - try one at a time with more delay */
+                LOG_WRN("Memory constraint while sending queued acknowledgment, will retry");
+                /* Just try one command at a time in this case */
+                return;
+            } else if (err == -EAGAIN) {
+                /* Connection not ready yet, try again later */
+                LOG_INF("Connection not ready for queued acknowledgments, will retry later");
+                return;
+            }
+        }
+    }
+    
+    /* Stop the timer if queue is empty */
+    if (ack_queue_count == 0) {
+        k_timer_stop(&ack_timer);
+        LOG_INF("Acknowledgment queue processed successfully");
+    }
+}
+
+/* Timer callback for processing the acknowledgment queue */
+static void ack_timer_handler(struct k_timer *timer) {
+    process_ack_queue();
+}
+
 /* Helper function to send a command acknowledgment
  * 
  * This function creates a command acknowledgment with the same command value
@@ -109,6 +267,22 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
  * @return 0 on success, negative error code on failure
  */
 static int send_command_ack(uint8_t cmd_byte) {
+    /* Check for active connection before proceeding */
+    if (!is_connected || !current_conn) {
+        LOG_WRN("Cannot send command acknowledgment for cmd 0x%02x - no active connection", cmd_byte);
+        return -ENOTCONN;
+    }
+
+    /* Check if connection has had time to stabilize */
+    uint32_t now = k_uptime_get_32();
+    uint32_t conn_age = now - connection_time;
+    
+    if (conn_age < connection_ready_delay) {
+        LOG_DBG("Not sending immediate ack for cmd 0x%02x - connection too fresh (%u ms < %u ms)",
+               cmd_byte, conn_age, connection_ready_delay);
+        return -EAGAIN;  /* Use EAGAIN to indicate temporary unavailability */
+    }
+
     /* Format according to protocol: START_BYTE + LENGTH_BYTE + COLON + CMD_BYTE + CRC(2) + SEMICOLON + END_BYTE */
     uint8_t ack_buffer[8];
     
@@ -279,12 +453,26 @@ static int send_notification_safely(const void *data, uint16_t len) {
             /* Only log connection resets occasionally */
             static uint32_t last_conn_reset_time = 0;
             if (now_err - last_conn_reset_time > 5000) {
-                LOG_ERR("Connection issue detected, resetting connection state");
+                LOG_WRN("Connection issue detected in notification (%d) - marking as disconnected", err);
                 last_conn_reset_time = now_err;
+            }
+            
+            /* Check if we're already in disconnect callback (in which case current_conn might be NULL) */
+            if (!is_connected) {
+                /* Already disconnected, nothing to do */
+                return err;
             }
             
             /* Reset connection on critical errors */
             if (current_conn) {
+                /* Clear the acknowledgment queue before resetting connection */
+                if (ack_queue_count > 0) {
+                    LOG_INF("Clearing acknowledgment queue (%d items) due to connection issue", ack_queue_count);
+                    memset(ack_queue, 0, sizeof(ack_queue));
+                    ack_queue_count = 0;
+                    k_timer_stop(&ack_timer);
+                }
+                
                 bt_conn_unref(current_conn);
                 current_conn = NULL;
             }
@@ -491,17 +679,37 @@ static ssize_t custom_char_write(struct bt_conn *conn,
             cmd_byte == CMD_COMMAND_DATA ||
             cmd_byte == CMD_COMMAND_TIMEDATA) {
             
-            LOG_INF("Received command 0x%02x, sending immediate acknowledgment", cmd_byte);
+            /* Always attempt to acknowledge commands that should be acknowledged */
+            LOG_INF("Received command 0x%02x, preparing acknowledgment", cmd_byte);
             
-            /* Send an acknowledgment with the same command byte */
-            int err = send_command_ack(cmd_byte);
-            
-            /* Only log success or non-connection errors */
-            if (err == 0) {
-                LOG_INF("Command acknowledgment sent for cmd 0x%02x", cmd_byte);
-            } else if (err != -ENOTCONN && err != -ENOTSUP) {
-                /* We don't log connection errors because they're expected when no device is connected */
-                LOG_ERR("Failed to send command acknowledgment (err %d)", err);
+            /* Check if we have an active connection */
+            if (is_connected && current_conn) {
+                /* Check if connection has had time to stabilize */
+                uint32_t now = k_uptime_get_32();
+                uint32_t conn_age = now - connection_time;
+                
+                if (conn_age >= connection_ready_delay) {
+                    /* Connection is stable, send immediate acknowledgment */
+                    LOG_INF("Connection stable, sending immediate acknowledgment for cmd 0x%02x", cmd_byte);
+                    
+                    /* Send an acknowledgment with the same command byte */
+                    int err = send_command_ack(cmd_byte);
+                    
+                    /* Only log success or non-connection errors */
+                    if (err == 0) {
+                        LOG_INF("Command acknowledgment sent for cmd 0x%02x", cmd_byte);
+                    } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                        /* We don't log connection errors because they're expected when no device is connected */
+                        LOG_ERR("Failed to send command acknowledgment (err %d)", err);
+                    }
+                } else {
+                    /* Connection too fresh, queue acknowledgment for later */
+                    LOG_INF("Connection too fresh (%u ms < %u ms), queuing acknowledgment for later processing",
+                           conn_age, connection_ready_delay);
+                    queue_command_ack(cmd_byte);
+                }
+            } else {
+                LOG_WRN("No active connection for cmd 0x%02x - acknowledgment skipped", cmd_byte);
             }
         }
     }
@@ -569,8 +777,6 @@ static ssize_t ios_cmd_write(struct bt_conn *conn,
             cmd_byte == CMD_COMMAND_DATA ||
             cmd_byte == CMD_COMMAND_TIMEDATA) {
             
-            LOG_INF("Received iOS command 0x%02x, sending immediate acknowledgment", cmd_byte);
-            
             /* Before sending ack, process the command through message processor */
             int ret = submit_command(ios_cmd_buffer, total_len);
             if (ret) {
@@ -579,15 +785,37 @@ static ssize_t ios_cmd_write(struct bt_conn *conn,
                 LOG_INF("iOS command submitted to message processor successfully");
             }
             
-            /* Send an acknowledgment with the same command byte */
-            int err = send_command_ack(cmd_byte);
+            /* Always attempt to acknowledge commands that should be acknowledged */
+            LOG_INF("Received iOS command 0x%02x, preparing acknowledgment", cmd_byte);
             
-            /* Only log success or non-connection errors */
-            if (err == 0) {
-                LOG_INF("iOS Command acknowledgment sent for cmd 0x%02x", cmd_byte);
-            } else if (err != -ENOTCONN && err != -ENOTSUP) {
-                /* We don't log connection errors because they're expected when no device is connected */
-                LOG_ERR("Failed to send iOS command acknowledgment (err %d)", err);
+            /* Check if we have an active connection */
+            if (is_connected && current_conn) {
+                /* Check if connection has had time to stabilize */
+                uint32_t now = k_uptime_get_32();
+                uint32_t conn_age = now - connection_time;
+                
+                if (conn_age >= connection_ready_delay) {
+                    /* Connection is stable, send immediate acknowledgment */
+                    LOG_INF("Connection stable, sending immediate acknowledgment for iOS cmd 0x%02x", cmd_byte);
+                    
+                    /* Send an acknowledgment with the same command byte */
+                    int err = send_command_ack(cmd_byte);
+                    
+                    /* Only log success or non-connection errors */
+                    if (err == 0) {
+                        LOG_INF("iOS Command acknowledgment sent for cmd 0x%02x", cmd_byte);
+                    } else if (err != -ENOTCONN && err != -ENOTSUP) {
+                        /* We don't log connection errors because they're expected when no device is connected */
+                        LOG_ERR("Failed to send iOS command acknowledgment (err %d)", err);
+                    }
+                } else {
+                    /* Connection too fresh, queue acknowledgment for later */
+                    LOG_INF("Connection too fresh (%u ms < %u ms), queuing iOS acknowledgment for later processing",
+                           conn_age, connection_ready_delay);
+                    queue_command_ack(cmd_byte);
+                }
+            } else {
+                LOG_WRN("No active connection for iOS cmd 0x%02x - acknowledgment skipped", cmd_byte);
             }
             
             return total_len;
@@ -861,6 +1089,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
     is_connected = true;
     connection_time = k_uptime_get_32();  /* Record when connection was established */
     
+    /* Make sure our connection is marked as active so no commands get dropped during init */
+    LOG_INF("Connected at %u ms - marking connection as active", connection_time);
+    
     /* Ensure CPR session is inactive when a new connection is established */
     cpr_session_active = false;
     cpr_session_start_time = 0;
@@ -879,6 +1110,17 @@ static void connected(struct bt_conn *conn, uint8_t err)
     
     LOG_INF("Connection established at %u ms, allowing %u ms before notifications",
            connection_time, connection_ready_delay);
+    
+    /* Start the acknowledgment queue timer to process any pending acknowledgments */
+    if (ack_queue_count > 0) {
+        LOG_INF("Found %d pending acknowledgments, starting queue processing", ack_queue_count);
+        
+        /* Start at half the connection ready delay to ensure we start processing 
+         * acknowledgments as soon as the connection has stabilized */
+        k_timer_start(&ack_timer, 
+                     K_MSEC(connection_ready_delay/2),  /* First run at half the connection ready delay */
+                     K_MSEC(250));                      /* Check every 250ms after that */
+    }
 }
 
 /* Disconnected callback */
@@ -894,6 +1136,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         current_conn = NULL;
     }
     is_connected = false;
+    
+    /* Clear the acknowledgment queue */
+    if (ack_queue_count > 0) {
+        LOG_INF("Clearing acknowledgment queue (%d items) on disconnect", ack_queue_count);
+        memset(ack_queue, 0, sizeof(ack_queue));
+        ack_queue_count = 0;
+        k_timer_stop(&ack_timer);
+    }
     
     /* Schedule delayed advertising restart */
     LOG_INF("Scheduling advertising restart after disconnect");
@@ -1366,9 +1616,16 @@ int main(void)
     /* Initialize notification timer */
     k_timer_init(&notify_timer, notify_timer_handler, NULL);
     
+    /* Initialize acknowledgment queue timer */
+    k_timer_init(&ack_timer, ack_timer_handler, NULL);
+    
     /* Initialize LED timer to check for LED requests */
     k_timer_init(&led_timer, led_timer_handler, NULL);
     k_timer_start(&led_timer, K_MSEC(100), K_MSEC(100));  /* Check every 100ms */
+    
+    /* Clear the acknowledgment queue */
+    memset(ack_queue, 0, sizeof(ack_queue));
+    ack_queue_count = 0;
     
     /* Initialize the advertising work queue item */
     k_work_init_delayable(&adv_work, advertising_work_handler);
