@@ -11,6 +11,7 @@
 #include <errno.h>
 #include "../ble_notifications.h"
 #include "crc/crc16_koopman.h"
+#include "crc/crc16_koopman_hw.h"
 
 /* Define our own error constants in case errno.h doesn't provide them */
 #ifndef EINVAL
@@ -86,7 +87,7 @@ static inline int format_ble_command(uint8_t *buffer, size_t buf_size,
     /* Calculate and add CRC if requested */
     if (add_crc) {
         /* CRC calculation starts from START_BYTE and includes everything up to this point */
-        uint16_t crc = crc16_koopman(buffer, i);
+        uint16_t crc = crc16_koopman_hw(buffer, i);
         
         /* Add the CRC bytes (big endian) */
         buffer[i++] = (uint8_t)(crc >> 8);    /* MSB of CRC */
@@ -246,7 +247,7 @@ static inline bool verify_ble_message_crc(const uint8_t *buffer, size_t length)
         return false;
     }
     
-    uint16_t calculated_crc = crc16_koopman(buffer, crc_data_len);
+    uint16_t calculated_crc = crc16_koopman_hw(buffer, crc_data_len);
     
     /* Extract received CRC (big endian) */
     uint16_t received_crc = ((uint16_t)buffer[crc_data_len] << 8) | buffer[crc_data_len + 1];

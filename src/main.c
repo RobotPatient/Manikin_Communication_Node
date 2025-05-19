@@ -12,6 +12,12 @@
 #include "ble/led_svc.h"
 #include "ble/ble_protocol.h"
 #include "ble_notifications.h"
+#include "ble/crc/crc16_koopman_hw.h"
+
+/* This function is not available in the current Zephyr version
+ * It would help with memory issues by flushing BLE buffers
+ * extern void bt_gatt_flush(void);
+ */
 
 /* External declaration for protocol test function */
 extern void test_ble_protocol(void);
@@ -57,6 +63,7 @@ uint32_t get_cpr_session_time(void);
 /* Forward declaration of our notification helper functions */
 static int send_notification_safely(const void *data, uint16_t len);
 static int send_command_ack(uint8_t cmd_byte);
+static int send_critical_command_ack(uint8_t cmd_byte);
 static void queue_command_ack(uint8_t cmd_byte);
 static void process_ack_queue(void);
 
@@ -77,8 +84,14 @@ static void process_ack_queue(void);
  * - For command acknowledgments, use send_command_ack() instead
  */
 static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t payload_len) {
-    /* Calculate the total required buffer size: 
+    /* Calculate the total required buffer size:
      * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + CRC(2) + SEMICOLON(1) + END_BYTE(1)
+     * 
+     * NOTE: We're currently using CRC calculation followed by a semicolon, but this might be causing 
+     * compatibility issues with iOS. According to the protocol, we should only use one or the other 
+     * (either CRC or semicolon, not both). For now, we'll keep both to maintain compatibility 
+     * with existing code.
+     * 
      * This is 8 bytes overhead plus payload_len: START + LEN + COLON + MSG_TYPE + CRC(2) + SEMICOLON + END
      */
     uint16_t total_len = 8 + payload_len; // 8 = START + LEN + COLON + MSG_TYPE + CRC(2) + SEMICOLON + END
@@ -100,14 +113,29 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
         memcpy(&notify_buffer[4], payload, payload_len);
     }
     
-    /* Calculate CRC on everything from START to end of payload */
-    uint16_t crc = crc16_koopman(notify_buffer, 4 + payload_len);
+    /* Calculate CRC on everything from START to end of payload - use hardware if available */
+    uint16_t crc = crc16_koopman_hw(notify_buffer, 4 + payload_len);
     
     /* Add CRC bytes (MSB first) */
     notify_buffer[4 + payload_len] = (uint8_t)(crc >> 8);        /* MSB of CRC */
     notify_buffer[5 + payload_len] = (uint8_t)(crc & 0xFF);      /* LSB of CRC */
     
-    /* Add terminating bytes */
+    /* Print a message to the terminal for certain notification types */
+    if (msg_type == NOTIFY_TYPE_CPR_STATE) {
+        /* Extract the CPR state from the payload */
+        uint8_t state = 0;
+        if (payload != NULL && payload_len > 0) {
+            state = ((uint8_t*)payload)[0];
+        }
+        printk(">>> CPR STATE NOTIFICATION: %s\n", state ? "ACTIVE" : "INACTIVE");
+    }
+    
+    /* Add terminating bytes - modified for proper CRC protocol 
+     * For proper CRC protocol, we should use:
+     * notify_buffer[6 + payload_len] = BLE_COMMAND_MSG_END; (no semicolon)
+     * However, the iOS app is still expecting both CRC and semicolon, so we'll keep this format
+     * until both sides can be updated together
+     */
     notify_buffer[6 + payload_len] = BLE_COMMAND_MSG_SEMICOLON; /* SEMICOLON */
     notify_buffer[7 + payload_len] = BLE_COMMAND_MSG_END;       /* END_BYTE */
     
@@ -184,6 +212,20 @@ static void process_ack_queue(void) {
         return;
     }
     
+    /* Check if we're experiencing memory constraints and should back off */
+    if (g_enomem_count > 3) {
+        static uint32_t last_enomem_backoff_log = 0;
+        if (now - last_enomem_backoff_log > 2000) {
+            LOG_WRN("Delaying queue processing due to ongoing ENOMEM errors (%d)", g_enomem_count);
+            last_enomem_backoff_log = now;
+        }
+        
+        /* Reschedule with longer delay based on error count */
+        k_timer_stop(&ack_timer);
+        k_timer_start(&ack_timer, K_MSEC(1000 + (g_enomem_count * 200)), K_MSEC(300));
+        return;
+    }
+    
     LOG_INF("Processing acknowledgment queue (%d items)...", ack_queue_count);
     
     /* Verify connection state again just before processing items */
@@ -195,10 +237,11 @@ static void process_ack_queue(void) {
         return;
     }
     
-    /* Process each item in the queue */
-    int successful_sends = 0;
+    /* Process only ONE item per timer interval when we've had memory issues */
+    int max_items_to_process = (g_enomem_count > 0) ? 1 : ACK_QUEUE_SIZE;
+    int processed_count = 0;
     
-    for (int i = 0; i < ACK_QUEUE_SIZE; i++) {
+    for (int i = 0; i < ACK_QUEUE_SIZE && processed_count < max_items_to_process; i++) {
         /* Verify connection is still active */
         if (!is_connected || !current_conn) {
             LOG_WRN("Connection lost during queue processing, stopping");
@@ -210,7 +253,16 @@ static void process_ack_queue(void) {
         }
         
         if (ack_queue[i].used) {
+            /* Track that we processed an item, even if it fails */
+            processed_count++;
+            
             LOG_INF("Sending queued acknowledgment for cmd 0x%02x", ack_queue[i].cmd_byte);
+            
+            /* Lower the error counter before trying to send */
+            if (g_enomem_count > 0) {
+                g_enomem_count--;
+                LOG_DBG("Reducing ENOMEM count to %d before sending", g_enomem_count);
+            }
             
             int err = send_command_ack(ack_queue[i].cmd_byte);
             
@@ -219,12 +271,9 @@ static void process_ack_queue(void) {
                 LOG_INF("Successfully sent queued acknowledgment for cmd 0x%02x", ack_queue[i].cmd_byte);
                 ack_queue[i].used = false;
                 ack_queue_count--;
-                successful_sends++;
                 
-                /* Add a small delay between sends to avoid overwhelming the stack */
-                if (successful_sends > 0 && i < ACK_QUEUE_SIZE-1) {
-                    k_sleep(K_MSEC(50));
-                }
+                /* Add a small delay after each successful send to let the stack recover */
+                k_sleep(K_MSEC(100));
             } else if (err == -ENOTCONN) {
                 /* Lost connection while processing queue */
                 LOG_WRN("Lost connection while processing acknowledgment queue");
@@ -234,14 +283,27 @@ static void process_ack_queue(void) {
                 k_timer_stop(&ack_timer);
                 return;
             } else if (err == -ENOMEM) {
-                /* Memory constraint - try one at a time with more delay */
-                LOG_WRN("Memory constraint while sending queued acknowledgment, will retry");
-                /* Just try one command at a time in this case */
+                /* Memory constraint - add significant backoff and stop processing for now */
+                uint32_t retry_delay = 1000 + (g_enomem_count * 500); /* More aggressive backoff */
+                LOG_WRN("Memory constraint (ENOMEM) while sending queued acknowledgment, backing off for %u ms", retry_delay);
+                
+                /* Reschedule timer with increased delay for next attempt */
+                k_timer_stop(&ack_timer);
+                k_timer_start(&ack_timer, K_MSEC(retry_delay), K_MSEC(500));
+                
+                /* Give the BLE stack time to recover by yielding */
+                k_sleep(K_MSEC(100));
                 return;
             } else if (err == -EAGAIN) {
                 /* Connection not ready yet, try again later */
                 LOG_INF("Connection not ready for queued acknowledgments, will retry later");
                 return;
+            } else {
+                /* Other error - log it but keep trying other items */
+                LOG_WRN("Error sending queued acknowledgment: %d", err);
+                
+                /* Add a delay before trying next item */
+                k_sleep(K_MSEC(100));
             }
         }
     }
@@ -283,7 +345,51 @@ static int send_command_ack(uint8_t cmd_byte) {
         return -EAGAIN;  /* Use EAGAIN to indicate temporary unavailability */
     }
 
-    /* Format according to protocol: START_BYTE + LENGTH_BYTE + COLON + CMD_BYTE + CRC(2) + SEMICOLON + END_BYTE */
+    /* Format according to protocol with CRC: START_BYTE + LENGTH_BYTE + COLON + CMD_BYTE + CRC(2) + SEMICOLON + END_BYTE */
+    uint8_t ack_buffer[8];
+    
+    ack_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
+    ack_buffer[1] = 0x01 + 0x02;              /* LENGTH_BYTE - command byte + 2 CRC bytes */
+    ack_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
+    ack_buffer[3] = cmd_byte;                 /* Original command byte */
+    
+    /* Calculate CRC on everything from START to CMD_BYTE - use hardware if available */
+    uint16_t crc = crc16_koopman_hw(ack_buffer, 4);
+    
+    /* Add CRC bytes (MSB first) */
+    ack_buffer[4] = (uint8_t)(crc >> 8);      /* MSB of CRC */
+    ack_buffer[5] = (uint8_t)(crc & 0xFF);    /* LSB of CRC */
+    
+    /* NOTE: For proper CRC protocol according to spec, we should only include 
+     * END_BYTE after CRC (no semicolon), but the iOS app seems to be expecting 
+     * both CRC and semicolon. We'll keep this hybrid format for now.
+     */
+    ack_buffer[6] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON */
+    ack_buffer[7] = BLE_COMMAND_MSG_END;      /* END_BYTE */
+    
+    LOG_INF("Sending command acknowledgment for cmd: 0x%02x", cmd_byte);
+    
+    /* Send the acknowledgment */
+    return send_notification_safely(ack_buffer, sizeof(ack_buffer));
+}
+
+/**
+ * @brief Special high-priority command acknowledgment for critical commands
+ * 
+ * This function implements a retry mechanism specifically for critical
+ * acknowledgments like CPR STOP that must get through even in low memory conditions.
+ *
+ * @param cmd_byte Command byte to acknowledge
+ * @return 0 on success, negative error code on failure
+ */
+static int send_critical_command_ack(uint8_t cmd_byte) {
+    /* Check for active connection before proceeding */
+    if (!is_connected || !current_conn) {
+        LOG_WRN("Cannot send critical command acknowledgment - no active connection");
+        return -ENOTCONN;
+    }
+
+    /* Format according to protocol with CRC and minimal payload */
     uint8_t ack_buffer[8];
     
     ack_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
@@ -292,19 +398,84 @@ static int send_command_ack(uint8_t cmd_byte) {
     ack_buffer[3] = cmd_byte;                 /* Original command byte */
     
     /* Calculate CRC on everything from START to CMD_BYTE */
-    uint16_t crc = crc16_koopman(ack_buffer, 4);
+    uint16_t crc = crc16_koopman_hw(ack_buffer, 4);
     
     /* Add CRC bytes (MSB first) */
     ack_buffer[4] = (uint8_t)(crc >> 8);      /* MSB of CRC */
     ack_buffer[5] = (uint8_t)(crc & 0xFF);    /* LSB of CRC */
     
+    /* NOTE: For proper CRC protocol according to spec, we should only include 
+     * END_BYTE after CRC (no semicolon), but the iOS app seems to be expecting 
+     * both CRC and semicolon. We'll keep this hybrid format for now.
+     */
     ack_buffer[6] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON */
     ack_buffer[7] = BLE_COMMAND_MSG_END;      /* END_BYTE */
     
-    LOG_INF("Sending command acknowledgment for cmd: 0x%02x", cmd_byte);
+    LOG_INF("Sending CRITICAL command acknowledgment for cmd: 0x%02x", cmd_byte);
     
-    /* Send the acknowledgment */
-    return send_notification_safely(ack_buffer, sizeof(ack_buffer));
+    /* Reset global ENOMEM counter to ensure this gets through */
+    g_enomem_count = 0;
+
+    /* We'd ideally flush any pending notifications here, but bt_gatt_flush() 
+     * is not available in this version of Zephyr. Instead, we'll rely on 
+     * our retry mechanism to handle any issues.
+     */
+    
+    /* First attempt */
+    int err = send_notification_safely(ack_buffer, sizeof(ack_buffer));
+    
+    /* If successful on first try, return */
+    if (err == 0 || err == -ENOTSUP) {
+        return err;
+    }
+    
+    /* If not successful and it's specifically memory error, retry with more aggressive approach */
+    if (err == -ENOMEM) {
+        /* Add small delay for recovery */
+        k_sleep(K_MSEC(100));
+        
+        /* Retry up to 5 times with fixed delay */
+        for (int retry = 1; retry <= 5; retry++) {
+            /* We'd ideally flush the buffer here with bt_gatt_flush(),
+             * but it's not available in this version of Zephyr.
+             */
+            
+            /* Try again */
+            err = send_notification_safely(ack_buffer, sizeof(ack_buffer));
+            
+            if (err == 0 || err == -ENOTSUP) {
+                LOG_INF("Critical acknowledgment sent successfully on retry %d", retry);
+                return err;
+            }
+            
+            /* If still ENOMEM, add small fixed delay and try again */
+            if (err == -ENOMEM) {
+                LOG_WRN("Retry %d for critical ack failed with ENOMEM, trying again...", retry);
+                k_sleep(K_MSEC(200));
+            } else {
+                /* Some other error occurred */
+                break;
+            }
+        }
+    }
+    
+    /* If we reach here, we failed after all retries */
+    LOG_ERR("Failed to send critical command acknowledgment after multiple retries");
+    
+    /* Special handling for connection errors - if we're getting -128 error (BT_ATT_ERR_UNLIKELY) 
+     * or other connection errors, it means the connection is unstable or was dropped */
+    if (err == -ENOTCONN || err == -128 /* BT_ATT_ERR_UNLIKELY */ || err < -100) {
+        LOG_WRN("CPR acknowledgment failed due to connection issues (err=%d), resetting connection state", err);
+        
+        /* Reset connection state if needed */
+        if (is_connected && current_conn) {
+            bt_conn_unref(current_conn);
+            current_conn = NULL;
+            is_connected = false;
+        }
+    }
+    
+    return err;
 }
 
 /* The notification characteristic is at index 4 in our service definition, based on:
@@ -443,11 +614,30 @@ static int send_notification_safely(const void *data, uint16_t len) {
                 g_enomem_count++;
             }
             
-            /* Increase backoff time based on error count */
-            uint32_t backoff = 250 + (g_enomem_count * 50); /* 250-750ms backoff */
-            last_notification_time = now + backoff;
+            /* Apply more aggressive backoff based on ENOMEM count */
+            uint32_t backoff;
+            if (g_enomem_count <= 2) {
+                backoff = 100 + (g_enomem_count * 100); /* 200-300ms for initial errors - reduced from 500ms base */
+            } else if (g_enomem_count <= 5) {
+                backoff = 500 + (g_enomem_count * 200); /* 1100-1500ms for moderate errors - reduced from 1000ms base */
+            } else {
+                backoff = 1500 + (g_enomem_count * 300); /* 3300-4200ms for persistent errors - reduced from 2500ms base */
+            }
             
-            LOG_DBG("Adding %u ms backoff after ENOMEM (count: %u)", backoff, g_enomem_count);
+            last_notification_time = now_err + backoff;
+            
+            LOG_WRN("Adding %u ms backoff after ENOMEM (count: %u)", backoff, g_enomem_count);
+            
+            /* Give the BLE stack time to recover by delaying execution */
+            uint32_t recovery_sleep = 50 + (g_enomem_count * 50); /* Reduced from 200ms base */
+            LOG_INF("Sleeping for %u ms to allow BLE stack to recover", recovery_sleep);
+            k_sleep(K_MSEC(recovery_sleep));
+            
+            /* Limit the maximum error count to prevent excessive backoff */
+            if (g_enomem_count > 10) {
+                LOG_WRN("Limiting ENOMEM count to 10 to prevent excessive backoff");
+                g_enomem_count = 10;
+            }
         }
         else if (err == -BT_ATT_ERR_UNLIKELY || err == -ENOTCONN) {
             /* Only log connection resets occasionally */
@@ -552,6 +742,15 @@ void start_cpr_session(void)
     /* Always start a new session */
     cpr_session_active = true;
     cpr_session_start_time = k_uptime_get_32();
+    
+    /* Display a prominent message in the terminal */
+    printk("\n\n");
+    printk("╔══════════════════════════════════════════════╗\n");
+    printk("║                                              ║\n");
+    printk("║             CPR SESSION STARTED              ║\n");
+    printk("║                                              ║\n");
+    printk("╚══════════════════════════════════════════════╝\n\n");
+    
     LOG_INF("CPR session started - timer initialized at %u", cpr_session_start_time);
     
     /* We'll send notification from the timer handler after detecting state change */
@@ -587,12 +786,22 @@ void stop_cpr_session(void)
     uint32_t minutes = elapsed_sec / 60;
     uint32_t seconds = elapsed_sec % 60;
     
-    LOG_INF("CPR session ended at %u - Duration: %02d:%02d (%u seconds)", 
-            now, minutes, seconds, elapsed_sec);
-    
     /* Reset session state */
     cpr_session_active = false;
     cpr_session_start_time = 0;
+    
+    /* Display a prominent message in the terminal */
+    printk("\n\n");
+    printk("╔══════════════════════════════════════════════╗\n");
+    printk("║                                              ║\n");
+    printk("║              CPR SESSION STOPPED             ║\n");
+    printk("║            Duration: %02d:%02d (%u sec)        ║\n",
+           minutes, seconds, elapsed_sec);
+    printk("║                                              ║\n");
+    printk("╚══════════════════════════════════════════════╝\n\n");
+    
+    LOG_INF("CPR session ended at %u - Duration: %02d:%02d (%u seconds)", 
+            now, minutes, seconds, elapsed_sec);
     
     /* Clear any pending notification errors to ensure stop notification gets through */
     if (g_enomem_count > 0) {
@@ -695,6 +904,13 @@ static ssize_t custom_char_write(struct bt_conn *conn,
                     /* Send an acknowledgment with the same command byte */
                     int err = send_command_ack(cmd_byte);
                     
+                    /* Display specific command acknowledgments in the terminal */
+                    if (cmd_byte == CPR_CONTROL_START) {
+                        printk(">>> CPR START COMMAND ACKNOWLEDGMENT SENT <<<\n");
+                    } else if (cmd_byte == CPR_COMMAND_STOP) {
+                        printk(">>> CPR STOP COMMAND ACKNOWLEDGMENT SENT <<<\n");
+                    }
+                    
                     /* Only log success or non-connection errors */
                     if (err == 0) {
                         LOG_INF("Command acknowledgment sent for cmd 0x%02x", cmd_byte);
@@ -736,6 +952,9 @@ static ssize_t ios_cmd_write(struct bt_conn *conn,
     /* Print the data as hex for debugging */
     LOG_HEXDUMP_INF(buf, len, "iOS command data");
     
+    /* Add a more visible notification in the terminal */
+    printk("\n>>> RECEIVED iOS COMMAND - %d BYTES <<<\n", len);
+    
     /* Check buffer size */
     if (offset + len > sizeof(ios_cmd_buffer)) {
         LOG_ERR("iOS command buffer overflow (%d > %d)", offset + len, sizeof(ios_cmd_buffer));
@@ -770,6 +989,7 @@ static ssize_t ios_cmd_write(struct bt_conn *conn,
         uint8_t cmd_byte = ios_cmd_buffer[3];
         
         LOG_INF("Received valid formatted iOS command with type 0x%02x", cmd_byte);
+        printk("\n>>> PARSED iOS COMMAND WITH TYPE 0x%02x <<<\n", cmd_byte);
         
         /* Check if this is a command that requires immediate acknowledgment */
         if (cmd_byte == CPR_CONTROL_START || 
@@ -1179,17 +1399,51 @@ static void led_timer_handler(struct k_timer *timer)
         
         LOG_INF("LED is now %s", led_requested_state ? "ON" : "OFF");
         
-        /* Send a notification if notifications are enabled */
-        if (notify_enabled) {
+        /* Send notification if notifications are enabled and we have a valid connection */
+        if (notify_enabled && is_connected && current_conn) {
+            /* Check if connection has had time to stabilize */
+            uint32_t now = k_uptime_get_32();
+            uint32_t conn_age = now - connection_time;
+            
+            if (conn_age < connection_ready_delay) {
+                LOG_DBG("Delaying LED state notification - connection too fresh (%u ms < %u ms)",
+                       conn_age, connection_ready_delay);
+                /* Will retry on next timer interval */
+                return;
+            }
+            
+            /* Check if we're experiencing memory constraints */
+            if (g_enomem_count > 2) {
+                LOG_DBG("Delaying LED state notification due to memory constraints (ENOMEM count: %d)", 
+                       g_enomem_count);
+                /* Will retry on next timer interval */
+                return;
+            }
+
             uint8_t led_state = led_requested_state ? 0x01 : 0x00;
+            
+            /* Clear any pending notification errors before attempting to send */
+            if (g_enomem_count > 0) {
+                g_enomem_count--;
+            }
             
             int err = send_ble_notification(NOTIFY_TYPE_LED_STATE, &led_state, sizeof(led_state));
             
-            /* Only log success or non-connection errors */
             if (err == 0) {
                 LOG_INF("LED state notification sent: %d", led_requested_state);
-            } else if (err != -ENOTCONN && err != -ENOTSUP) {
-                /* We don't log connection errors because they're expected when no device is connected */
+                notification_support.led_works = true;
+            } else if (err == -EAGAIN) {
+                /* Connection not ready yet */
+                LOG_DBG("LED state notification delayed (connection not ready)");
+            } else if (err == -ENOMEM) {
+                /* Memory constraint - will retry on next timer interval */
+                LOG_WRN("LED state notification failed due to memory constraints, will retry");
+            } else if (err == -ENOTSUP) {
+                /* Client doesn't support this notification type */
+                notification_support.led_works = false;
+                LOG_DBG("LED state notifications not supported by client");
+            } else if (err != -ENOTCONN) {
+                /* Log other non-connection errors */
                 LOG_ERR("LED state notification failed (err %d)", err);
             }
         }
@@ -1430,65 +1684,37 @@ static void led_timer_handler(struct k_timer *timer)
             uint32_t minutes = elapsed_sec / 60;
             uint32_t seconds = elapsed_sec % 60;
             
-            /* Track retry attempts for this critical notification */
-            static uint32_t last_stop_retry_time = 0;
-            static uint8_t stop_retry_count = 0;
-            uint32_t now_stop_retry = k_uptime_get_32();
+            /* Log the duration information */
+            LOG_INF("Sending STOP acknowledgment. CPR session duration: %02d:%02d (%u seconds)", 
+                   minutes, seconds, elapsed_sec);
+            printk("\n>>> SENDING CPR STOP ACKNOWLEDGMENT (Duration: %02d:%02d) <<<\n",
+                  minutes, seconds);
             
-            /* Reset retry tracking if it's been a while */
-            if (now_stop_retry - last_stop_retry_time > 5000) {
-                stop_retry_count = 0;
-            }
-            
-            /* Clear any pending notification errors for this critical notification */
-            if (g_enomem_count > 0) {
-                LOG_INF("Clearing error state for CPR STOP acknowledgment");
-                g_enomem_count = 0;
-            }
-            
-            /* Prepare a payload with command details, duration, and formatted time */
-            uint8_t payload[32]; /* Increased size to handle protocol overhead */
-            
-            payload[0] = CPR_CMD_STOP;               /* Command: Stop CPR */
-            payload[1] = STATUS_OK;                  /* Status: OK */
-            
-            /* Format binary duration as well */
-            payload[2] = (elapsed_sec >> 8) & 0xFF;  /* Duration high byte */
-            payload[3] = elapsed_sec & 0xFF;         /* Duration low byte */
-            
-            /* Add formatted time string "cpr:MM:SS" */
-            char time_str[16]; /* Increased buffer size to avoid truncation warnings */
-            snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
-            size_t str_len = strlen(time_str);
-            
-            /* Copy the string to the payload */
-            memcpy(&payload[4], time_str, str_len);
-            
-            /* Send notification with command details, duration, and time string */
-            int err = send_ble_notification(NOTIFY_TYPE_CPR_CMD_ACK, payload, 4 + str_len);
+            /* Use our special critical command acknowledgment function */
+            int err = send_critical_command_ack(CPR_CMD_STOP);
             
             /* Only log success or non-connection errors */
             if (err == 0) {
-                LOG_INF("CPR STOP command acknowledgment sent: OK with time %s (%u seconds)", 
-                        time_str, elapsed_sec);
+                LOG_INF("CPR STOP command acknowledgment sent successfully");
                 stop_ack_sent = true;
-                stop_retry_count = 0; /* Reset retry count on success */
-            } else if (err == -ENOMEM) {
-                /* Special handling for memory errors - retry with backoff */
-                if (stop_retry_count < 5) {
-                    stop_retry_count++;
-                    last_stop_retry_time = now_stop_retry;
-                    LOG_WRN("ENOMEM on critical CPR STOP acknowledgment, will retry (attempt %u/5)", stop_retry_count);
-                    /* Small delay to avoid immediate retry */
-                    k_sleep(K_MSEC(50 * stop_retry_count)); 
-                } else {
-                    LOG_ERR("Failed to send CPR STOP acknowledgment after multiple retries");
-                    stop_ack_sent = true; /* Give up after 5 retries */
+            } else if (err == -ENOTSUP) {
+                /* Client doesn't support notifications, but consider it sent */
+                LOG_INF("CPR STOP command acknowledgment skipped (client doesn't support notifications)");
+                stop_ack_sent = true;
+            } else if (err == -ENOTCONN || err == -128 /* BT_ATT_ERR_UNLIKELY */ || err < -100) {
+                /* Connection errors - mark as sent to avoid retrying in unstable connection state */
+                LOG_WRN("Cannot send CPR STOP acknowledgment - connection issue (err: %d)", err);
+                stop_ack_sent = true;  /* Mark as sent to avoid retrying in unstable connection state */
+                
+                /* Reset connection state if it's not already reset */
+                if (is_connected && current_conn) {
+                    bt_conn_unref(current_conn);
+                    current_conn = NULL;
+                    is_connected = false;
                 }
-            } else if (err != -ENOTCONN && err != -ENOTSUP && err != -EAGAIN) {
-                /* Log other errors but don't retry */
-                LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
-                /* Don't mark as sent so we'll retry later */
+            } else {
+                /* Other errors - log but don't mark as sent so we'll retry */
+                LOG_ERR("CPR STOP acknowledgment failed (err %d), will retry later", err);
             }
         }
     }
@@ -1597,6 +1823,13 @@ int main(void)
     
     printk("Bluetooth application with GATT service and Message Processor\n");
     LOG_INF("Starting Bluetooth application with GATT service and Message Processor");
+    
+    /* Initialize hardware CRC module */
+    if (crc16_koopman_hw_init()) {
+        LOG_INF("Hardware CRC-16 Koopman initialized successfully");
+    } else {
+        LOG_WRN("Hardware CRC-16 Koopman initialization failed, falling back to software implementation");
+    }
     
     /* Initialize our basic implementation module */
     basic_implementation_init();

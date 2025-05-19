@@ -166,6 +166,11 @@ static void process_id_string(const uint8_t *data, size_t len, bool is_instructo
     LOG_INF("Set %s ID: %s", 
             is_instructor ? "instructor" : "trainee", 
             id_storage);
+            
+    /* Add prominent notification in terminal */
+    printk("\n>>> RECEIVED %s ID: %s <<<\n", 
+            is_instructor ? "INSTRUCTOR" : "TRAINEE", 
+            id_storage);
     
     /* Request LED on */
     request_led_state(true);
@@ -195,6 +200,9 @@ static void process_time_data(const uint8_t *data_payload, size_t data_len)
     
     /* Log the time data for debugging */
     LOG_INF("Time data received: %s", time_data);
+    
+    /* Add prominent notification in terminal */
+    printk("\n>>> RECEIVED TIME DATA: %s <<<\n", time_data);
     
     /* Format for display */
     if (copy_len >= 14) {
@@ -305,12 +313,14 @@ static int process_direct_command(uint8_t cmd_byte)
             
         case CMD_CONTROL_START:
             LOG_INF("Command: Start CPR");
+            printk("\n>>> iOS SENT DIRECT CPR START COMMAND (0x%02x) <<<\n", cmd_byte);
             start_cpr_session();
             request_led_state(true);
             break;
             
         case CMD_COMMAND_STOP:
             LOG_INF("Command: Stop CPR");
+            printk("\n>>> iOS SENT DIRECT CPR STOP COMMAND (0x%02x) <<<\n", cmd_byte);
             stop_cpr_session();
             request_led_state(false);
             break;
@@ -373,18 +383,21 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
     }
     else if (command == CMD_CONTROL_START) {
         LOG_INF("Command: Start CPR");
+        printk("\n>>> iOS SENT CPR START COMMAND (0x%02x) <<<\n", command);
         request_led_state(true);
         LOG_INF("Calling start_cpr_session() from message_processor_simple");
         start_cpr_session();  /* Call CPR session start function */
     }
     else if (command == CMD_COMMAND_STOP) {
         LOG_INF("Command: Stop CPR");
+        printk("\n>>> iOS SENT CPR STOP COMMAND (0x%02x) <<<\n", command);
         request_led_state(false);
         LOG_INF("Calling stop_cpr_session() from message_processor_simple");
         stop_cpr_session();   /* Call CPR session stop function */
     }
     else if (command == CMD_COMMAND_DATA) {
         LOG_INF("Command: Received CPR Init Data");
+        printk("\n>>> iOS SENT ID DATA COMMAND (0x%02x) <<<\n", command);
         
         /* Process the CPR data payload */
         if (len > 4) {
@@ -393,6 +406,7 @@ static int process_command(uint8_t *cmd_data, uint16_t len)
     }
     else if (command == CMD_COMMAND_TIMEDATA) {
         LOG_INF("Command: Received Time Data");
+        printk("\n>>> iOS SENT TIME DATA COMMAND (0x%02x) <<<\n", command);
         
         /* Process the time data payload */
         if (len > 4) {

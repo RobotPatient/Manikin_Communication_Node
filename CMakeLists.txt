@@ -25,6 +25,7 @@ target_sources(app PRIVATE
   src/ble/led_svc.c
   src/ble/ble_protocol.c
   src/ble/crc/crc16_koopman.c
+  src/ble/crc/crc16_koopman_hw.c
   )
 
 # Add Bluetooth sample includes for reference
