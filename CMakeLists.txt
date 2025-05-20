@@ -19,10 +19,11 @@ zephyr_include_directories(
 target_sources(app PRIVATE
   src/main.c
   src/basic_implementation.c
-  src/can_wrapper_mock.c
+  src/can/can_transport.c
   src/message_processor/message_processor_simple.c
   src/ble/led_svc.c
   src/ble/ble_protocol.c
+  src/session/session.c
   )
 
 # Add Bluetooth sample includes for reference

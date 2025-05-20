@@ -1,4 +1,4 @@
-/* Minimal main.c with Bluetooth initialization and GATT service */
+#include "session.h"
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/printk.h>
@@ -21,7 +21,9 @@ extern void test_ble_protocol(void);
 #include <stdint.h>
 #include <string.h>
 
-LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+LOG_MODULE_REGISTER(session, LOG_LEVEL_INF);
+
 
 /* Global connection tracking variables - declared at file scope */
 struct bt_conn *current_conn = NULL;
@@ -252,6 +254,7 @@ static int send_notification_safely(const void *data, uint16_t len) {
     
     return err;
 }
+
 
 /* Constants moved to ble_notifications.h */
 static bool notify_enabled = false;
@@ -685,10 +688,6 @@ BT_GATT_SERVICE_DEFINE(custom_svc,
                           BT_GATT_PERM_WRITE | BT_GATT_PERM_PREPARE_WRITE,  /* Support long writes */
                           NULL, ios_cmd_write, ios_cmd_buffer),
 );
-
-/* Note: Using minimal advertising data directly in the advertising function */
-
-/* Work queue item for delayed advertising */
 static struct k_work_delayable adv_work;
 
 /* Robust advertising function with work queue handling */
@@ -1197,11 +1196,129 @@ static void led_timer_handler(struct k_timer *timer)
     }
 }
 
-/* Main entry point */
-int main(void)
-{
-    int err;
+K_THREAD_STACK_DEFINE(ble_ios_thread_stack, 1024);
+struct k_thread ble_ios_thread_data;
+
+void ble_ios_task(void *arg1, void *arg2, void* arg3) {
+    while(1) {
+    char time_buffer[24] = {0};
+    char rtc_time[24] = {0};
     
+    /* First get and display raw time data */
+    if (has_received_time_data()) {
+        size_t time_len = get_time_data(time_buffer, sizeof(time_buffer));
+        if (time_len > 0) {
+            /* Format time data for display: YYYYMMDDHHMMSS -> YYYY-MM-DD HH:MM:SS */
+            char formatted_time[24] = {0};
+            if (time_len >= 14) {
+                snprintf(formatted_time, sizeof(formatted_time), 
+                         "%.4s-%.2s-%.2s %.2s:%.2s:%.2s",
+                         time_buffer, time_buffer+4, time_buffer+6,
+                         time_buffer+8, time_buffer+10, time_buffer+12);
+                //LOG_INF("Heartbeat - Raw time data: %s", formatted_time);
+            } else {
+                LOG_INF("Heartbeat - Raw time data available but invalid format: %s", time_buffer);
+            }
+        } else {
+            LOG_INF("Heartbeat - Raw time data empty");
+        }
+    } else {
+        LOG_INF("Heartbeat - No raw time data received yet");
+    }
+    
+    /* Now get and display formatted RTC time */
+    size_t rtc_len = get_rtc_time(rtc_time, sizeof(rtc_time));
+    if (rtc_len > 0) {
+        LOG_INF("====== CURRENT TIME: %s ======", rtc_time);
+    } else {
+        LOG_INF("====== RTC TIME NOT AVAILABLE ======");
+    }
+    
+    /* Get user role information */
+    uint8_t role = get_user_role();
+    if (role != USER_ROLE_NONE) {
+        char id_buffer[20] = {0};
+        if (role == USER_ROLE_INSTRUCTOR) {
+            get_instructor_id(id_buffer, sizeof(id_buffer));
+            LOG_INF("Heartbeat - Role: Instructor, ID: %s", id_buffer);
+        } else if (role == USER_ROLE_TRAINEE) {
+            get_trainee_id(id_buffer, sizeof(id_buffer));
+            LOG_INF("Heartbeat - Role: Trainee, ID: %s", id_buffer);
+        }
+    } else {
+        LOG_INF("Heartbeat - No user role set");
+    }
+    
+    /* Periodically display CPR session state - only log every 5 seconds to reduce noise */
+    static uint32_t last_cpr_log_time = 0;
+    uint32_t now = k_uptime_get_32();
+    if (now - last_cpr_log_time >= 5000) {
+        last_cpr_log_time = now;
+        
+        if (cpr_session_active) {
+            /* Get current CPR session time and display it */
+            uint32_t elapsed_sec = get_cpr_session_time();
+            uint32_t minutes = elapsed_sec / 60;
+            uint32_t seconds = elapsed_sec % 60;
+                
+            LOG_INF("****** CPR SESSION ACTIVE - %02d:%02d elapsed ******", minutes, seconds);
+        } else {
+            LOG_INF("------ No CPR session active ------");
+        }
+    }
+    
+    /* No automatic CPR session start/stop - controlled only by commands */
+    
+    /* Make sure we can receive instructor ID commands */
+    static bool sent_id = false;
+    if (!sent_id && k_uptime_get_32() > 10000) {  /* After 10 seconds */
+        const char *test_id = "in:test123";
+        LOG_INF("Sending test instructor ID: %s", test_id);
+        submit_command((const uint8_t *)test_id, strlen(test_id));
+        sent_id = true;
+    }
+    
+    /* After 15 seconds, send a test time data command */
+    static bool sent_time = false;
+    if (!sent_time && k_uptime_get_32() > 15000) {
+        LOG_INF("Sending test time data: 20250506150722");
+        
+        /* Use the new protocol formatting */
+        const char *time_data = "20250506150722";
+        uint8_t time_cmd[32];
+        
+        int cmd_len = format_timedata_command(time_cmd, sizeof(time_cmd), 
+                                            time_data, strlen(time_data));
+        
+        if (cmd_len > 0) {
+            LOG_INF("Formatted time data command using protocol, length: %d bytes", cmd_len);
+            LOG_HEXDUMP_INF(time_cmd, cmd_len, "Formatted time data command");
+            submit_command(time_cmd, cmd_len);
+        } else {
+            LOG_ERR("Failed to format time data command: %d", cmd_len);
+            
+            /* Fall back to old format for backward compatibility */
+            uint8_t old_time_cmd[] = {
+                MSG_COMMAND_BYTE_START,  /* Start byte */
+                MSG_COMMAND_MSG_COLON,   /* Command separator */
+                CMD_COMMAND_TIMEDATA,    /* Time data command */
+                MSG_COMMAND_MSG_COLON,   /* Data separator */
+                '2', '0', '2', '5', '0', '5', '0', '6', '1', '5', '0', '7', '2', '2', /* Time data */
+                MSG_COMMAND_MSG_END      /* End byte */
+            };
+            
+            submit_command(old_time_cmd, sizeof(old_time_cmd));
+        }
+        
+        sent_time = true;
+    }
+    
+    k_sleep(K_SECONDS(2));
+}
+}
+
+int session_init() {
+    int err;
     printk("Bluetooth application with GATT service and Message Processor\n");
     LOG_INF("Starting Bluetooth application with GATT service and Message Processor");
     
@@ -1293,123 +1410,22 @@ int main(void)
     
     /* Wait for everything to initialize */
     k_sleep(K_SECONDS(2));
-    
-    /* Enhanced heartbeat in main thread with time data display */
-    while (1) {
-        char time_buffer[24] = {0};
-        char rtc_time[24] = {0};
-        
-        /* First get and display raw time data */
-        if (has_received_time_data()) {
-            size_t time_len = get_time_data(time_buffer, sizeof(time_buffer));
-            if (time_len > 0) {
-                /* Format time data for display: YYYYMMDDHHMMSS -> YYYY-MM-DD HH:MM:SS */
-                char formatted_time[24] = {0};
-                if (time_len >= 14) {
-                    snprintf(formatted_time, sizeof(formatted_time), 
-                             "%.4s-%.2s-%.2s %.2s:%.2s:%.2s",
-                             time_buffer, time_buffer+4, time_buffer+6,
-                             time_buffer+8, time_buffer+10, time_buffer+12);
-                    //LOG_INF("Heartbeat - Raw time data: %s", formatted_time);
-                } else {
-                    LOG_INF("Heartbeat - Raw time data available but invalid format: %s", time_buffer);
-                }
-            } else {
-                LOG_INF("Heartbeat - Raw time data empty");
-            }
-        } else {
-            LOG_INF("Heartbeat - No raw time data received yet");
-        }
-        
-        /* Now get and display formatted RTC time */
-        size_t rtc_len = get_rtc_time(rtc_time, sizeof(rtc_time));
-        if (rtc_len > 0) {
-            LOG_INF("====== CURRENT TIME: %s ======", rtc_time);
-        } else {
-            LOG_INF("====== RTC TIME NOT AVAILABLE ======");
-        }
-        
-        /* Get user role information */
-        uint8_t role = get_user_role();
-        if (role != USER_ROLE_NONE) {
-            char id_buffer[20] = {0};
-            if (role == USER_ROLE_INSTRUCTOR) {
-                get_instructor_id(id_buffer, sizeof(id_buffer));
-                LOG_INF("Heartbeat - Role: Instructor, ID: %s", id_buffer);
-            } else if (role == USER_ROLE_TRAINEE) {
-                get_trainee_id(id_buffer, sizeof(id_buffer));
-                LOG_INF("Heartbeat - Role: Trainee, ID: %s", id_buffer);
-            }
-        } else {
-            LOG_INF("Heartbeat - No user role set");
-        }
-        
-        /* Periodically display CPR session state - only log every 5 seconds to reduce noise */
-        static uint32_t last_cpr_log_time = 0;
-        uint32_t now = k_uptime_get_32();
-        if (now - last_cpr_log_time >= 5000) {
-            last_cpr_log_time = now;
-            
-            if (cpr_session_active) {
-                /* Get current CPR session time and display it */
-                uint32_t elapsed_sec = get_cpr_session_time();
-                uint32_t minutes = elapsed_sec / 60;
-                uint32_t seconds = elapsed_sec % 60;
-                    
-                LOG_INF("****** CPR SESSION ACTIVE - %02d:%02d elapsed ******", minutes, seconds);
-            } else {
-                LOG_INF("------ No CPR session active ------");
-            }
-        }
-        
-        /* No automatic CPR session start/stop - controlled only by commands */
-        
-        /* Make sure we can receive instructor ID commands */
-        static bool sent_id = false;
-        if (!sent_id && k_uptime_get_32() > 10000) {  /* After 10 seconds */
-            const char *test_id = "in:test123";
-            LOG_INF("Sending test instructor ID: %s", test_id);
-            submit_command((const uint8_t *)test_id, strlen(test_id));
-            sent_id = true;
-        }
-        
-        /* After 15 seconds, send a test time data command */
-        static bool sent_time = false;
-        if (!sent_time && k_uptime_get_32() > 15000) {
-            LOG_INF("Sending test time data: 20250506150722");
-            
-            /* Use the new protocol formatting */
-            const char *time_data = "20250506150722";
-            uint8_t time_cmd[32];
-            
-            int cmd_len = format_timedata_command(time_cmd, sizeof(time_cmd), 
-                                                time_data, strlen(time_data));
-            
-            if (cmd_len > 0) {
-                LOG_INF("Formatted time data command using protocol, length: %d bytes", cmd_len);
-                LOG_HEXDUMP_INF(time_cmd, cmd_len, "Formatted time data command");
-                submit_command(time_cmd, cmd_len);
-            } else {
-                LOG_ERR("Failed to format time data command: %d", cmd_len);
-                
-                /* Fall back to old format for backward compatibility */
-                uint8_t old_time_cmd[] = {
-                    MSG_COMMAND_BYTE_START,  /* Start byte */
-                    MSG_COMMAND_MSG_COLON,   /* Command separator */
-                    CMD_COMMAND_TIMEDATA,    /* Time data command */
-                    MSG_COMMAND_MSG_COLON,   /* Data separator */
-                    '2', '0', '2', '5', '0', '5', '0', '6', '1', '5', '0', '7', '2', '2', /* Time data */
-                    MSG_COMMAND_MSG_END      /* End byte */
-                };
-                
-                submit_command(old_time_cmd, sizeof(old_time_cmd));
-            }
-            
-            sent_time = true;
-        }
-        
-        k_sleep(K_SECONDS(2));
-    }
-    
+    k_tid_t tid = k_thread_create(&ble_ios_thread_data, ble_ios_thread_stack,
+        K_THREAD_STACK_SIZEOF(ble_ios_thread_stack),
+        ble_ios_task, NULL, NULL, NULL,
+        2, 0, K_NO_WAIT);
+if (!tid) {
+printk("ERROR spawning rx thread\n");
+return 0;
+}
+k_thread_name_set(tid, "ble_ios_task");
+    return 0;
+}
+
+int session_start() {
+    return 0;
+}
+
+int session_stop() {
     return 0;
 }
