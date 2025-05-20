@@ -8,11 +8,13 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/gpio.h>
+/* Removed SD card related includes */
 #include "message_processor/message_processor.h"
 #include "ble/led_svc.h"
 #include "ble/ble_protocol.h"
 #include "ble_notifications.h"
 #include "ble/crc/crc16_koopman_hw.h"
+/* Removed SD card handler include */
 
 /* This function is not available in the current Zephyr version
  * It would help with memory issues by flushing BLE buffers
@@ -41,6 +43,9 @@ static uint8_t notify_buffer[128] = {0}; /* Increased buffer size for protocol f
 /* Global BLE notification error tracking */
 static uint32_t g_last_enomem_time = 0;
 static uint8_t g_enomem_count = 0;
+
+/* Protocol format control */
+static bool use_legacy_protocol = true;  /* Start with legacy protocol (no CRC) to be compatible with iOS app */
 
 /* Command acknowledgment queue for handling commands during connection setup */
 #define ACK_QUEUE_SIZE 8
@@ -84,17 +89,22 @@ static void process_ack_queue(void);
  * - For command acknowledgments, use send_command_ack() instead
  */
 static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t payload_len) {
-    /* Calculate the total required buffer size:
-     * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + CRC(2) + SEMICOLON(1) + END_BYTE(1)
+    /* Calculate the total required buffer size based on protocol format:
      * 
-     * NOTE: We're currently using CRC calculation followed by a semicolon, but this might be causing 
-     * compatibility issues with iOS. According to the protocol, we should only use one or the other 
-     * (either CRC or semicolon, not both). For now, we'll keep both to maintain compatibility 
-     * with existing code.
-     * 
-     * This is 8 bytes overhead plus payload_len: START + LEN + COLON + MSG_TYPE + CRC(2) + SEMICOLON + END
+     * Legacy format (no CRC):
+     * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + SEMICOLON(1) + END_BYTE(1)
+     * = 6 bytes overhead plus payload_len
+     *
+     * CRC format (no semicolon):
+     * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + CRC(2) + END_BYTE(1)
+     * = 7 bytes overhead plus payload_len
      */
-    uint16_t total_len = 8 + payload_len; // 8 = START + LEN + COLON + MSG_TYPE + CRC(2) + SEMICOLON + END
+    uint16_t total_len;
+    if (use_legacy_protocol) {
+        total_len = 6 + payload_len; // 6 = START + LEN + COLON + MSG_TYPE + SEMICOLON + END
+    } else {
+        total_len = 7 + payload_len; // 7 = START + LEN + COLON + MSG_TYPE + CRC(2) + END
+    }
     
     /* Check if we have space in buffer */
     if (total_len > sizeof(notify_buffer)) {
@@ -102,9 +112,15 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
         return -EINVAL;
     }
     
-    /* Format the notification according to protocol with CRC */
+    /* Format the notification according to selected protocol */
     notify_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
-    notify_buffer[1] = payload_len + 1 + 2;      /* LENGTH_BYTE - payload plus msg_type byte plus 2 CRC bytes */
+    
+    if (use_legacy_protocol) {
+        notify_buffer[1] = payload_len + 1;      /* LENGTH_BYTE - payload plus msg_type byte (legacy format) */
+    } else {
+        notify_buffer[1] = payload_len + 1 + 2;  /* LENGTH_BYTE - payload plus msg_type byte plus 2 CRC bytes */
+    }
+    
     notify_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
     notify_buffer[3] = msg_type;                 /* Message type */
     
@@ -113,12 +129,17 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
         memcpy(&notify_buffer[4], payload, payload_len);
     }
     
-    /* Calculate CRC on everything from START to end of payload - use hardware if available */
-    uint16_t crc = crc16_koopman_hw(notify_buffer, 4 + payload_len);
+    /* Prepare index for terminating bytes */
+    uint16_t index = 4 + payload_len;
     
-    /* Add CRC bytes (MSB first) */
-    notify_buffer[4 + payload_len] = (uint8_t)(crc >> 8);        /* MSB of CRC */
-    notify_buffer[5 + payload_len] = (uint8_t)(crc & 0xFF);      /* LSB of CRC */
+    /* For CRC format, calculate and add CRC bytes */
+    if (!use_legacy_protocol) {
+        uint16_t crc = crc16_koopman_hw(notify_buffer, index);
+        
+        /* Add CRC bytes (MSB first) */
+        notify_buffer[index++] = (uint8_t)(crc >> 8);        /* MSB of CRC */
+        notify_buffer[index++] = (uint8_t)(crc & 0xFF);      /* LSB of CRC */
+    }
     
     /* Print a message to the terminal for certain notification types */
     if (msg_type == NOTIFY_TYPE_CPR_STATE) {
@@ -130,14 +151,13 @@ static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t
         printk(">>> CPR STATE NOTIFICATION: %s\n", state ? "ACTIVE" : "INACTIVE");
     }
     
-    /* Add terminating bytes - modified for proper CRC protocol 
-     * For proper CRC protocol, we should use:
-     * notify_buffer[6 + payload_len] = BLE_COMMAND_MSG_END; (no semicolon)
-     * However, the iOS app is still expecting both CRC and semicolon, so we'll keep this format
-     * until both sides can be updated together
-     */
-    notify_buffer[6 + payload_len] = BLE_COMMAND_MSG_SEMICOLON; /* SEMICOLON */
-    notify_buffer[7 + payload_len] = BLE_COMMAND_MSG_END;       /* END_BYTE */
+    /* Add terminating bytes based on protocol format */
+    if (use_legacy_protocol) {
+        notify_buffer[index++] = BLE_COMMAND_MSG_SEMICOLON; /* SEMICOLON (legacy format) */
+        notify_buffer[index++] = BLE_COMMAND_MSG_END;       /* END_BYTE */
+    } else {
+        notify_buffer[index++] = BLE_COMMAND_MSG_END;       /* END_BYTE (CRC format - no semicolon) */
+    }
     
     /* Send notification */
     return send_notification_safely(notify_buffer, total_len);
@@ -345,32 +365,43 @@ static int send_command_ack(uint8_t cmd_byte) {
         return -EAGAIN;  /* Use EAGAIN to indicate temporary unavailability */
     }
 
-    /* Format according to protocol with CRC: START_BYTE + LENGTH_BYTE + COLON + CMD_BYTE + CRC(2) + SEMICOLON + END_BYTE */
-    uint8_t ack_buffer[8];
+    /* Format according to selected protocol */
+    uint8_t ack_buffer[8]; /* Buffer size for worst case (CRC format) */
+    uint8_t idx = 0;
     
-    ack_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
-    ack_buffer[1] = 0x01 + 0x02;              /* LENGTH_BYTE - command byte + 2 CRC bytes */
-    ack_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
-    ack_buffer[3] = cmd_byte;                 /* Original command byte */
+    ack_buffer[idx++] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
     
-    /* Calculate CRC on everything from START to CMD_BYTE - use hardware if available */
-    uint16_t crc = crc16_koopman_hw(ack_buffer, 4);
+    if (use_legacy_protocol) {
+        ack_buffer[idx++] = 0x01;                 /* LENGTH_BYTE - just command byte (legacy format) */
+    } else {
+        ack_buffer[idx++] = 0x01 + 0x02;          /* LENGTH_BYTE - command byte + 2 CRC bytes */
+    }
     
-    /* Add CRC bytes (MSB first) */
-    ack_buffer[4] = (uint8_t)(crc >> 8);      /* MSB of CRC */
-    ack_buffer[5] = (uint8_t)(crc & 0xFF);    /* LSB of CRC */
+    ack_buffer[idx++] = BLE_COMMAND_MSG_COLON;    /* COLON */
+    ack_buffer[idx++] = cmd_byte;                 /* Original command byte */
     
-    /* NOTE: For proper CRC protocol according to spec, we should only include 
-     * END_BYTE after CRC (no semicolon), but the iOS app seems to be expecting 
-     * both CRC and semicolon. We'll keep this hybrid format for now.
-     */
-    ack_buffer[6] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON */
-    ack_buffer[7] = BLE_COMMAND_MSG_END;      /* END_BYTE */
+    /* For CRC format, calculate and add CRC */
+    if (!use_legacy_protocol) {
+        /* Calculate CRC on everything from START to CMD_BYTE - use hardware if available */
+        uint16_t crc = crc16_koopman_hw(ack_buffer, idx);
+        
+        /* Add CRC bytes (MSB first) */
+        ack_buffer[idx++] = (uint8_t)(crc >> 8);      /* MSB of CRC */
+        ack_buffer[idx++] = (uint8_t)(crc & 0xFF);    /* LSB of CRC */
+    }
+    
+    /* Add terminating bytes based on protocol format */
+    if (use_legacy_protocol) {
+        ack_buffer[idx++] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON (legacy format) */
+        ack_buffer[idx++] = BLE_COMMAND_MSG_END;      /* END_BYTE */
+    } else {
+        ack_buffer[idx++] = BLE_COMMAND_MSG_END;      /* END_BYTE (CRC format - no semicolon) */
+    }
     
     LOG_INF("Sending command acknowledgment for cmd: 0x%02x", cmd_byte);
     
-    /* Send the acknowledgment */
-    return send_notification_safely(ack_buffer, sizeof(ack_buffer));
+    /* Send the acknowledgment with the correct size */
+    return send_notification_safely(ack_buffer, idx);
 }
 
 /**
@@ -389,27 +420,38 @@ static int send_critical_command_ack(uint8_t cmd_byte) {
         return -ENOTCONN;
     }
 
-    /* Format according to protocol with CRC and minimal payload */
-    uint8_t ack_buffer[8];
+    /* Format according to selected protocol */
+    uint8_t ack_buffer[8]; /* Buffer size for worst case (CRC format) */
+    uint8_t idx = 0;
     
-    ack_buffer[0] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
-    ack_buffer[1] = 0x01 + 0x02;              /* LENGTH_BYTE - command byte + 2 CRC bytes */
-    ack_buffer[2] = BLE_COMMAND_MSG_COLON;    /* COLON */
-    ack_buffer[3] = cmd_byte;                 /* Original command byte */
+    ack_buffer[idx++] = BLE_COMMAND_BYTE_START;   /* START_BYTE */
     
-    /* Calculate CRC on everything from START to CMD_BYTE */
-    uint16_t crc = crc16_koopman_hw(ack_buffer, 4);
+    if (use_legacy_protocol) {
+        ack_buffer[idx++] = 0x01;                 /* LENGTH_BYTE - just command byte (legacy format) */
+    } else {
+        ack_buffer[idx++] = 0x01 + 0x02;          /* LENGTH_BYTE - command byte + 2 CRC bytes */
+    }
     
-    /* Add CRC bytes (MSB first) */
-    ack_buffer[4] = (uint8_t)(crc >> 8);      /* MSB of CRC */
-    ack_buffer[5] = (uint8_t)(crc & 0xFF);    /* LSB of CRC */
+    ack_buffer[idx++] = BLE_COMMAND_MSG_COLON;    /* COLON */
+    ack_buffer[idx++] = cmd_byte;                 /* Original command byte */
     
-    /* NOTE: For proper CRC protocol according to spec, we should only include 
-     * END_BYTE after CRC (no semicolon), but the iOS app seems to be expecting 
-     * both CRC and semicolon. We'll keep this hybrid format for now.
-     */
-    ack_buffer[6] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON */
-    ack_buffer[7] = BLE_COMMAND_MSG_END;      /* END_BYTE */
+    /* For CRC format, calculate and add CRC */
+    if (!use_legacy_protocol) {
+        /* Calculate CRC on everything from START to CMD_BYTE */
+        uint16_t crc = crc16_koopman_hw(ack_buffer, idx);
+        
+        /* Add CRC bytes (MSB first) */
+        ack_buffer[idx++] = (uint8_t)(crc >> 8);      /* MSB of CRC */
+        ack_buffer[idx++] = (uint8_t)(crc & 0xFF);    /* LSB of CRC */
+    }
+    
+    /* Add terminating bytes based on protocol format */
+    if (use_legacy_protocol) {
+        ack_buffer[idx++] = BLE_COMMAND_MSG_SEMICOLON;/* SEMICOLON (legacy format) */
+        ack_buffer[idx++] = BLE_COMMAND_MSG_END;      /* END_BYTE */
+    } else {
+        ack_buffer[idx++] = BLE_COMMAND_MSG_END;      /* END_BYTE (CRC format - no semicolon) */
+    }
     
     LOG_INF("Sending CRITICAL command acknowledgment for cmd: 0x%02x", cmd_byte);
     
@@ -421,8 +463,8 @@ static int send_critical_command_ack(uint8_t cmd_byte) {
      * our retry mechanism to handle any issues.
      */
     
-    /* First attempt */
-    int err = send_notification_safely(ack_buffer, sizeof(ack_buffer));
+    /* First attempt with the correct buffer size */
+    int err = send_notification_safely(ack_buffer, idx);
     
     /* If successful on first try, return */
     if (err == 0 || err == -ENOTSUP) {
@@ -440,8 +482,8 @@ static int send_critical_command_ack(uint8_t cmd_byte) {
              * but it's not available in this version of Zephyr.
              */
             
-            /* Try again */
-            err = send_notification_safely(ack_buffer, sizeof(ack_buffer));
+            /* Try again with the correct buffer size */
+            err = send_notification_safely(ack_buffer, idx);
             
             if (err == 0 || err == -ENOTSUP) {
                 LOG_INF("Critical acknowledgment sent successfully on retry %d", retry);
@@ -1071,9 +1113,19 @@ static void notify_timer_handler(struct k_timer *timer)
             
             /* Only try sending if global tracking says it works */
             static uint32_t last_heartbeat_attempt = 0;
+            static bool warned_about_heartbeat = false;
             
+            /* Check if heartbeat notifications have permanently failed previously */
+            if (notification_support.heartbeat_works == false && last_heartbeat_attempt > (UINT32_MAX/3)) {
+                /* Skip completely - notifications disabled permanently */
+                if (!warned_about_heartbeat) {
+                    LOG_INF("Heartbeat notifications remain disabled - not supported by client");
+                    warned_about_heartbeat = true;
+                }
+                /* Skip sending entirely */
+            }
             /* Only try sending if it's worked before or we haven't tried in a while */
-            if (notification_support.heartbeat_works || (now - last_heartbeat_attempt > 60000)) {
+            else if (notification_support.heartbeat_works || (now - last_heartbeat_attempt > 60000)) {
                 last_heartbeat_attempt = now;
                 
                 /* Try sending heartbeat notification */
@@ -1083,6 +1135,7 @@ static void notify_timer_handler(struct k_timer *timer)
                     LOG_DBG("Periodic notification sent: %d", notify_count);
                     last_sent_time = now;
                     notification_support.heartbeat_works = true;
+                    warned_about_heartbeat = false;
                 } else if (err == -ENOTSUP) {
                     /* This iOS client doesn't support heartbeat notifications - disable permanently */
                     notification_support.heartbeat_works = false;
@@ -1790,9 +1843,19 @@ static void led_timer_handler(struct k_timer *timer)
                 
                                 /* Use global notification support tracking */
                 static uint32_t last_attempt_time = 0;
+                static bool warned_about_time_data = false;
                 
+                /* Check if time notifications have permanently failed previously */
+                if (notification_support.time_works == false && last_attempt_time > (UINT32_MAX/3)) {
+                    /* Skip completely - notifications disabled permanently */
+                    if (!warned_about_time_data) {
+                        LOG_INF("Time data notifications remain disabled - not supported by client");
+                        warned_about_time_data = true;
+                    }
+                    /* Skip sending entirely */
+                }
                 /* Only try sending if it's worked before or we haven't tried in a while */
-                if (notification_support.time_works || (now - last_attempt_time > 60000)) {
+                else if (notification_support.time_works || (now - last_attempt_time > 60000)) {
                     last_attempt_time = now;
                     
                     /* Try to send notification with time data */
@@ -1801,6 +1864,7 @@ static void led_timer_handler(struct k_timer *timer)
                     if (err == 0) {
                         LOG_INF("Time data notification sent: %s", time_buffer);
                         notification_support.time_works = true;
+                        warned_about_time_data = false;
                     } else if (err == -ENOTSUP) {
                         /* This iOS client doesn't support time data notifications - disable permanently */
                         notification_support.time_works = false;
@@ -1821,8 +1885,8 @@ int main(void)
 {
     int err;
     
-    printk("Bluetooth application with GATT service and Message Processor\n");
-    LOG_INF("Starting Bluetooth application with GATT service and Message Processor");
+    printk("Bluetooth application with GATT service and SD card support\n");
+    LOG_INF("Starting Bluetooth application with GATT service and SD card support");
     
     /* Initialize hardware CRC module */
     if (crc16_koopman_hw_init()) {
@@ -1845,6 +1909,8 @@ int main(void)
         k_sleep(K_MSEC(500));
         led_off();
     }
+    
+    /* SD card initialization and testing removed */
     
     /* Initialize notification timer */
     k_timer_init(&notify_timer, notify_timer_handler, NULL);

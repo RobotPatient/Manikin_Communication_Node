@@ -1,0 +1,26 @@
+Instructions to Remove SD Card Functionality from main.c
+
+1. Find and remove the SD card header include (likely near the top of the file):
+   Search for and remove this line:
+   ```c
+   #include "sdcard_handler.h"
+   ```
+
+2. Find and remove the SD card initialization call (likely in main() function):
+   Search for and remove these lines:
+   ```c
+   /* Initialize SD card */
+   sdcard_init();
+   ```
+   or any similar call to sdcard_init() function.
+
+3. If you find any other SD card related functions or code (like test code),
+   you should remove those as well.
+
+These changes, together with the ones already made to:
+- prj.conf (removing SD card config options)
+- build.sh (removing SDMMC overlay reference)
+- CMakeLists.txt (removing sdcard_handler.c from sources)
+
+should completely eliminate the SD card functionality from the build and
+prevent the MPU fault that was occurring in the system workqueue thread.

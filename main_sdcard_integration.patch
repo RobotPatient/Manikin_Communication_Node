@@ -1,0 +1,21 @@
+Patch Instructions for Integrating SD Card Initialization
+
+1. Add the include at the top of main.c:
+
+#include "sdcard_init.h"
+
+2. Add the following code at the end of the main() function, just before any 
+   main loop or the return statement:
+
+    /* Initialize SD card in a delayed manner to avoid BLE disruption */
+    printk("Scheduling delayed SD card initialization\n");
+    sdcard_init_async();
+
+3. If any existing SD card initialization code exists in main.c, remove it or 
+   comment it out, as the new system will handle this safely.
+
+4. Build with:
+   ./build.sh
+
+5. Flash with:
+   west flash

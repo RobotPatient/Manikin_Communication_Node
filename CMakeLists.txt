@@ -26,6 +26,7 @@ target_sources(app PRIVATE
   src/ble/ble_protocol.c
   src/ble/crc/crc16_koopman.c
   src/ble/crc/crc16_koopman_hw.c
+  # Removed sdcard_handler.c to fix MPU faults
   )
 
 # Add Bluetooth sample includes for reference
