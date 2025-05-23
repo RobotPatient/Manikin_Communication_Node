@@ -26,6 +26,8 @@ K_THREAD_STACK_DEFINE(rx_sensorhub_sensor2_thread_stack, 1024);
 struct k_thread rx_sensorhub_sensor1_thread_data;
 struct k_thread rx_sensorhub_sensor2_thread_data;
 
+sample_sensor1_t sample;
+
 void rx_sensorhub_sensor1_thread(void *arg1, void *arg2, void *arg3)
 {
     ARG_UNUSED(arg1);
@@ -77,7 +79,6 @@ void rx_sensorhub_sensor1_thread(void *arg1, void *arg2, void *arg3)
 
         if (received_len >= sizeof(sample_sensor1_t))
         {
-            sample_sensor1_t sample;
             memcpy(&sample, rx_data, sizeof(sample_sensor1_t));
             printk("Sensor: %.*s\n", 8, sample.sensor_name);
             printk("Frame ID: %u\n", sample.frame_id);
@@ -89,7 +90,7 @@ void rx_sensorhub_sensor1_thread(void *arg1, void *arg2, void *arg3)
         }
     }
 }
-
+sample_sensor2_t ads7138_sample;
 void rx_sensorhub_sensor2_thread(void *arg1, void *arg2, void *arg3)
 {
     ARG_UNUSED(arg1);
@@ -119,18 +120,18 @@ void rx_sensorhub_sensor2_thread(void *arg1, void *arg2, void *arg3)
         }
         if (received_len >= sizeof(sample_sensor2_t))
         {
-            sample_sensor2_t sample;
-            memcpy(&sample, rx_buffer, sizeof(sample_sensor2_t));
-            printk("Sensor: %.*s\n", 8, sample.sensor_name);
-            printk("Frame ID: %u\n", sample.frame_id);
-            printk("CH1: %d mv\n", sample.data.ch1_mv);
-            printk("CH2: %d mv\n", sample.data.ch2_mv);
-            printk("CH3: %d mv\n", sample.data.ch3_mv);
-            printk("CH4: %d mv\n", sample.data.ch4_mv);
-            printk("CH5: %d mv\n", sample.data.ch5_mv);
-            printk("CH6: %d mv\n", sample.data.ch6_mv);
-            printk("CH7: %d mv\n", sample.data.ch7_mv);
-            printk("CH8: %d mv\n", sample.data.ch8_mv);
+
+            memcpy(&ads7138_sample, rx_buffer, sizeof(sample_sensor2_t));
+            printk("Sensor: %.*s\n", 8, ads7138_sample.sensor_name);
+            printk("Frame ID: %u\n", ads7138_sample.frame_id);
+            printk("CH1: %d mv\n", ads7138_sample.data.ch1_mv);
+            printk("CH2: %d mv\n", ads7138_sample.data.ch2_mv);
+            printk("CH3: %d mv\n", ads7138_sample.data.ch3_mv);
+            printk("CH4: %d mv\n", ads7138_sample.data.ch4_mv);
+            printk("CH5: %d mv\n", ads7138_sample.data.ch5_mv);
+            printk("CH6: %d mv\n", ads7138_sample.data.ch6_mv);
+            printk("CH7: %d mv\n", ads7138_sample.data.ch7_mv);
+            printk("CH8: %d mv\n", ads7138_sample.data.ch8_mv);
         }
         else
         {
