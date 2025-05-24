@@ -29,6 +29,30 @@ typedef struct __attribute__((__packed__))
     } data;
 } sample_sensor2_t;
 
+
+typedef struct __attribute__((__packed__))
+{
+    char sensor_name[8];
+    uint32_t frame_id;
+    struct
+    {
+        float pressure;
+        float temp;
+    } data;
+} sample_sensor3_t;
+
+typedef struct __attribute__((__packed__))
+{
+    char sensor_name[8];
+    uint32_t frame_id;
+    struct
+    {
+        float pitch_deg;
+        float roll_deg;
+        float yaw_deg;
+    } data;
+} sample_sensor4_t;
+
 typedef struct
 {
     // Byte 0
