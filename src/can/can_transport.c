@@ -5,6 +5,7 @@
 #include "can_rx_types.h"
 #include <session/session.h>
 
+
 #define CAN_CMD_LEN 1 // start/stop are single-byte
 #define SYSTEM_CMD_STOP 0
 #define SYSTEM_CMD_START 1
@@ -34,6 +35,68 @@ struct k_thread rx_sensorhub_sensor3_thread_data;
 
 K_THREAD_STACK_DEFINE(rx_sensorhub2_sensor1_thread_stack, 1024);
 struct k_thread rx_sensorhub2_sensor1_thread_data;
+
+
+#define MAX_FRAME_WINDOW 20
+
+#define VL_RING_SIZE    (MAX_FRAME_WINDOW * sizeof(sample_sensor1_t))
+#define ADS_RING_SIZE   (MAX_FRAME_WINDOW * sizeof(sample_sensor2_t))
+#define SDP_RING_SIZE   (MAX_FRAME_WINDOW * sizeof(sample_sensor3_t))
+#define BHI_RING_SIZE   (MAX_FRAME_WINDOW * sizeof(sample_sensor4_t))
+
+RING_BUF_DECLARE(vl_ring, VL_RING_SIZE);
+RING_BUF_DECLARE(ads_ring, ADS_RING_SIZE);
+RING_BUF_DECLARE(sdp_ring, SDP_RING_SIZE);
+RING_BUF_DECLARE(bhi_ring, BHI_RING_SIZE);
+
+uint8_t vl_backing_array[VL_RING_SIZE];
+uint8_t ads_backing_array[ADS_RING_SIZE];
+uint8_t sdp_backing_array[SDP_RING_SIZE];
+uint8_t bhi_backing_array[BHI_RING_SIZE];
+
+struct ring_buf bhi_ring;
+struct ring_buf vl_ring;
+struct ring_buf sdp_ring;
+struct ring_buf ads_ring;
+
+int process_bhi_sample(sample_sensor4_t *sample) {
+    ring_buf_put(&bhi_ring, (uint8_t *)sample, sizeof(sample_sensor4_t));
+    return 0;
+}
+
+int process_sdp_sample(sample_sensor3_t *sample) {
+    ring_buf_put(&sdp_ring, (uint8_t *)sample, sizeof(sample_sensor3_t));
+    return 0;
+}
+
+int process_vl_sample(sample_sensor1_t *sample) {
+    ring_buf_put(&vl_ring, (uint8_t *)sample, sizeof(sample_sensor1_t));
+    return 0;
+}
+
+int process_ads_sample(sample_sensor2_t *sample) {
+    ring_buf_put(&ads_ring, (uint8_t *)sample, sizeof(sample_sensor2_t));
+    return 0;
+}
+
+
+void can_transmit_start_msg() {
+    struct can_frame start_frame = {
+        .id = 0x0,
+        .dlc = 1,
+        .data = {0x01},
+    };
+    can_send(can_dev, &start_frame, K_NO_WAIT, NULL, NULL);
+}
+
+void can_transmit_stop_msg() {
+    struct can_frame stop_frame = {
+        .id = 0x0,
+        .dlc = 1,
+        .data = {120},
+    };
+    can_send(can_dev, &stop_frame, K_MSEC(2), NULL, NULL);
+}
 
 sample_sensor4_t bhi360_fusion_sample;
 void rx_sensorhub2_sensor1_thread(void *arg1, void *arg2, void *arg3)
@@ -67,6 +130,7 @@ void rx_sensorhub2_sensor1_thread(void *arg1, void *arg2, void *arg3)
         {
 
             memcpy(&bhi360_fusion_sample, rx_buffer, sizeof(sample_sensor4_t));
+            process_bhi_sample(&bhi360_fusion_sample);
             printk("Sensor: %.*s\n", 8, bhi360_fusion_sample.sensor_name);
             printk("Frame ID: %u\n", bhi360_fusion_sample.frame_id);
             printk("Pitch: %f deg\n", bhi360_fusion_sample.data.pitch_deg);
@@ -133,6 +197,7 @@ void rx_sensorhub_sensor1_thread(void *arg1, void *arg2, void *arg3)
         if (received_len >= sizeof(sample_sensor1_t))
         {
             memcpy(&sample, rx_data, sizeof(sample_sensor1_t));
+            process_vl_sample(&sample);
             printk("Sensor: %.*s\n", 8, sample.sensor_name);
             printk("Frame ID: %u\n", sample.frame_id);
             printk("Distance: %d mm\n", sample.data.distance_mm);
@@ -173,8 +238,8 @@ void rx_sensorhub_sensor2_thread(void *arg1, void *arg2, void *arg3)
         }
         if (received_len >= sizeof(sample_sensor2_t))
         {
-
             memcpy(&ads7138_sample, rx_buffer, sizeof(sample_sensor2_t));
+            process_ads_sample(&ads7138_sample);
             printk("Sensor: %.*s\n", 8, ads7138_sample.sensor_name);
             printk("Frame ID: %u\n", ads7138_sample.frame_id);
             printk("CH1: %d mv\n", ads7138_sample.data.ch1_mv);
@@ -227,8 +292,9 @@ void rx_sensorhub_sensor3_thread(void *arg1, void *arg2, void *arg3)
             memcpy(&sdp810_sample, rx_buffer, sizeof(sample_sensor3_t));
             printk("Sensor: %.*s\n", 8, sdp810_sample.sensor_name);
             printk("Frame ID: %u\n", sdp810_sample.frame_id);
-printk("Pressure: %.16f mbar\n", (double)sdp810_sample.data.pressure);
-printk("Temp: %.16f fahrenheit\n", (double)sdp810_sample.data.temp);
+            printk("Pressure: %.16f mbar\n", (double)sdp810_sample.data.pressure);
+            printk("Temp: %.16f fahrenheit\n", (double)sdp810_sample.data.temp);
+            process_sdp_sample(&sdp810_sample);
         }
         else
         {
@@ -307,7 +373,6 @@ int can_transport_init()
     k_tid_t tid;
     uint8_t rx_buf[50];
     int ret = 0;
-
     can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
     if (!device_is_ready(can_dev))
     {
@@ -321,6 +386,11 @@ int can_transport_init()
         printk("CAN: Failed to start device [%d]\n", ret);
         return 0;
     }
+
+    ring_buf_init(&vl_ring, ARRAY_SIZE(vl_backing_array), vl_backing_array);
+    ring_buf_init(&ads_ring, ARRAY_SIZE(ads_backing_array), ads_backing_array);
+    ring_buf_init(&sdp_ring, ARRAY_SIZE(sdp_backing_array), sdp_backing_array);
+    ring_buf_init(&bhi_ring, ARRAY_SIZE(bhi_backing_array), bhi_backing_array);
 
     tid = k_thread_create(&rx_sensorhub_sensor1_thread_data, rx_sensorhub_sensor1_thread_stack,
                           K_THREAD_STACK_SIZEOF(rx_sensorhub_sensor1_thread_stack),
@@ -407,5 +477,6 @@ int can_transport_init()
     {
         printk("Failed to get status [%d]\n", ret);
     }
+
     return 0;
 }

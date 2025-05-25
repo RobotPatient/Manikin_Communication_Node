@@ -8,11 +8,20 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/usb/usb_device.h>
+#include <zephyr/usb/usbd.h>
+
+#include <zephyr/fs/fs.h>
+#include <zephyr/storage/disk_access.h>
+#include <zephyr/logging/log.h>
+#include <ff.h> // for FATFS
+
 #include "message_processor/message_processor.h"
 #include "ble/led_svc.h"
 #include "ble/ble_protocol.h"
 #include "ble_notifications.h"
-
+#include "can/can_transport.h"
 /* External declaration for protocol test function */
 extern void test_ble_protocol(void);
 
@@ -21,9 +30,28 @@ extern void test_ble_protocol(void);
 #include <stdint.h>
 #include <string.h>
 
+#define BUF_SIZE 64
+#define START_CMD "start"
+#define STOP_CMD "stop"
+
+#define FILE_FLUSH_THRESHOLD 2048
+static char sd_write_buffer[FILE_FLUSH_THRESHOLD];
+static size_t sd_buf_offset = 0;
+
+struct fs_file_t session_file;
+#define CSV_LINE_MAX_LEN 256
+#define CSV_QUEUE_SIZE 16  // Number of queued lines
+
+K_MSGQ_DEFINE(csv_msgq, CSV_LINE_MAX_LEN, CSV_QUEUE_SIZE, 4);
+
+K_THREAD_STACK_DEFINE(sd_writer_stack, 1024);
+static struct k_thread sd_writer_thread;
 
 LOG_MODULE_REGISTER(session, LOG_LEVEL_INF);
 
+const struct device *const uart_dev = DEVICE_DT_GET_ONE(zephyr_cdc_acm_uart);
+K_THREAD_STACK_DEFINE(cdc_read_thread_stack, 1024);
+struct k_thread cdc_read_thread_stack_data;
 
 /* Global connection tracking variables - declared at file scope */
 struct bt_conn *current_conn = NULL;
@@ -31,8 +59,10 @@ bool is_connected = false;
 uint32_t connection_time = 0;   /* Time when connection was established */
 uint32_t connection_ready_delay = 2000;  /* Delay in ms before sending notifications */
 
+static struct k_timer sample_timer;
+
 /* Global notification buffer and state */
-static uint8_t notify_buffer[64] = {0}; /* Increased from 20 to 64 bytes to accommodate protocol format */
+static uint8_t notify_buffer[244] = {0}; /* Increased from 20 to 64 bytes to accommodate protocol format */
 
 /* Forward declarations for CPR session management */
 bool is_cpr_session_active(void);
@@ -42,6 +72,96 @@ uint32_t get_cpr_session_time(void);
 
 /* Forward declaration of our notification helper functions */
 static int send_notification_safely(const void *data, uint16_t len);
+
+static FATFS fat_fs;
+static bool fs_mounted = false;
+
+#define DISK_DRIVE_NAME "SD"
+#define DISK_MOUNT_PT "/"DISK_DRIVE_NAME":"
+#define FILE_PATH   DISK_MOUNT_PT"/hello.txt"
+
+
+/* We use the generic filesystem API instead of FATFS directly */
+static struct fs_mount_t fat_fs_mnt = {
+	.type = FS_FATFS,
+	.fs_data = &fat_fs,
+	.mnt_point = "/SD:"
+};
+
+static int init_sdcard()
+{
+       struct fs_file_t file;
+           int ret;
+	/* raw disk i/o */
+	do {
+		static const char *disk_pdrv = "SD";
+		uint64_t memory_size_mb;
+		uint32_t block_count;
+		uint32_t block_size;
+		
+		if (disk_access_init(disk_pdrv) != 0) {
+			printk("Storage init ERROR!");
+			break;
+		}
+		
+		if (disk_access_ioctl(disk_pdrv,
+			DISK_IOCTL_GET_SECTOR_COUNT, &block_count)) {
+				printk("Unable to get sector count");
+				break;
+			}
+		printk("Block count %u", block_count);
+		
+		if (disk_access_ioctl(disk_pdrv,
+			DISK_IOCTL_GET_SECTOR_SIZE, &block_size)) {
+				printk("Unable to get sector size");
+				break;
+			}
+		printk("Sector size %u", block_size);
+		
+		memory_size_mb = (uint64_t)block_count * block_size;
+		printk("Memory Size(MB) %u", (uint32_t)(memory_size_mb >> 20));
+	} while (0);
+
+	int res = fs_mount(&fat_fs_mnt);
+	
+	if (res == FR_OK) {
+        fs_mounted = true;
+		printk("SD Card mounted.");
+         fs_file_t_init(&file);
+
+    // Try opening the file to check if it exists
+    ret = fs_open(&file, FILE_PATH, FS_O_READ);
+    if (ret < 0) {
+        // File doesn't exist - create and write
+        printk("File doesn't exist. Creating and writing...\n");
+        ret = fs_open(&file, FILE_PATH, FS_O_CREATE | FS_O_WRITE);
+        if (ret < 0) {
+            printk("Failed to create file: %d\n", ret);
+            return 1;
+        }
+
+        const char *msg = "Hello World\n";
+        ssize_t bytes_written = fs_write(&file, msg, strlen(msg));
+        printk("Wrote %d bytes\n", bytes_written);
+    } else {
+        // File exists - read content
+        char buffer[64];
+        ssize_t bytes_read = fs_read(&file, buffer, sizeof(buffer) - 1);
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0'; // null-terminate
+            printk("Read from file: %s", buffer);
+        }
+    }
+
+    fs_close(&file);
+		// lsdir(fat_fs_mnt.mnt_point);
+	} else {
+		printk("Error mounting disk.\n");
+        return 1;
+	}	
+	return 0;
+}
+
 
 /* Helper function to prepare and send a notification using protocol format
  * 
@@ -305,6 +425,7 @@ bool is_cpr_session_active(void)
     return cpr_session_active;
 }
 
+char session_file_name[512];
 /* Function to handle CPR session start */
 void start_cpr_session(void) 
 {
@@ -321,13 +442,32 @@ void start_cpr_session(void)
     }
     
     /* Always start a new session */
-    cpr_session_active = true;
     cpr_session_start_time = k_uptime_get_32();
     LOG_INF("CPR session started - timer initialized at %u", cpr_session_start_time);
     
     /* We'll send notification from the timer handler after detecting state change */
     /* This is safer because the timer handler has context to access BLE services */
     LOG_INF("CPR session start: Notification will be sent via timer handler");
+    char instructor_id[64];
+    get_instructor_id(instructor_id, sizeof(instructor_id));
+    char start_time[64];
+    get_time_data(start_time, sizeof(start_time));
+    snprintf(session_file_name, sizeof(session_file_name),
+         "%s/cpr%d.csv\0", "/SD:", 0x01);
+    printf("file_name: %s\n", session_file_name);
+    int ret = fs_open(&session_file, session_file_name, FS_O_CREATE | FS_O_WRITE);
+        if (ret < 0) {
+            printk("Failed to create file: %d\n", ret);
+            return;
+        }
+    const char *csv_header = "sensor_name,frame_id,data0,data1,data2,data3,data4,data5,data6,data7\n";
+    ssize_t written = fs_write(&session_file, csv_header, strlen(csv_header));
+    if (written < 0) {
+        printk("Failed to write CSV header: %d\n", (int)written);
+        fs_close(&session_file);
+        return;
+    }
+    cpr_session_active = true;
 }
 
 /* Function to handle CPR session stop */
@@ -364,7 +504,7 @@ void stop_cpr_session(void)
     /* Reset session state */
     cpr_session_active = false;
     cpr_session_start_time = 0;
-    
+    fs_close(&session_file);
     /* Store elapsed time for notification via timer handler */
     LOG_INF("CPR session stop: Notification with duration %u seconds will be sent via timer handler", elapsed_sec);
 }
@@ -1317,8 +1457,210 @@ void ble_ios_task(void *arg1, void *arg2, void* arg3) {
 }
 }
 
+
+void process_command(const char *cmd)
+{
+    if (strncmp(cmd, START_CMD, strlen(START_CMD)) == 0)
+    {
+        printk("CAN sending started\n");
+        uart_fifo_fill(uart_dev, "CAN sending started\n", strlen("CAN sending started\n"));
+        start_cpr_session();
+        can_transmit_start_msg();
+    }
+    else if (strncmp(cmd, STOP_CMD, strlen(STOP_CMD)) == 0)
+    {
+        printk("CAN sending stopped\n");
+        uart_fifo_fill(uart_dev, "CAN sending stopped\n", strlen("CAN sending stopped\n"));
+        stop_cpr_session();
+        can_transmit_stop_msg();
+    }
+}
+
+void cdc_read_thread(void *arg1, void *arg2, void *arg3)
+{
+    uint8_t buf[BUF_SIZE];
+    size_t len = 0;
+
+    while (1)
+    {
+        int r = uart_fifo_read(uart_dev, buf + len, BUF_SIZE - len);
+        if (r > 0)
+        {
+            len += r;
+            if (buf[len - 1] == '\n' || buf[len - 1] == '\r')
+            {
+                buf[len - 1] = '\0';
+                process_command((char *)buf);
+                len = 0;
+            }
+        }
+        k_msleep(10);
+    }
+}
+
+char csv_buffer[256];  // 1024 is excessive for a single row
+
+void write_to_session_file(char *csv_formatted_text, size_t length) {
+    if (!cpr_session_active) {
+        printk("Session not active, skipping queue.\n");
+        return;
+    }
+
+    if (length >= CSV_LINE_MAX_LEN) {
+        printk("Line too long to queue\n");
+        return;
+    }
+
+    if (k_msgq_put(&csv_msgq, csv_formatted_text, K_NO_WAIT) != 0) {
+        printk("CSV queue full, dropping sample\n");
+    }
+}
+
+void write_vl_to_session_file(sample_sensor1_t* vl_samples, uint8_t num) {
+    for (uint8_t i = 0; i < num; i++) {
+        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
+                              "%s,%u,%d\n",
+                              vl_samples[i].sensor_name,
+                              vl_samples[i].frame_id,
+                              vl_samples[i].data.distance_mm);
+        write_to_session_file(csv_buffer, len);
+    }
+}
+
+void write_sdp_to_session_file(sample_sensor3_t* sdp_samples, uint8_t num) {
+    for (uint8_t i = 0; i < num; i++) {
+        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
+                              "%s,%u,%.4f,%.4f\n",
+                              sdp_samples[i].sensor_name,
+                              sdp_samples[i].frame_id,
+                              (double)sdp_samples[i].data.pressure,
+                              (double)sdp_samples[i].data.temp);
+        write_to_session_file(csv_buffer, len);
+    }
+}
+void write_ads_to_session_file(sample_sensor2_t* ads_samples, uint8_t num) {
+    for (uint8_t i = 0; i < num; i++) {
+        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
+                              "%s,%u,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                              ads_samples[i].sensor_name,
+                              ads_samples[i].frame_id,
+                              ads_samples[i].data.ch1_mv,
+                              ads_samples[i].data.ch2_mv,
+                              ads_samples[i].data.ch3_mv,
+                              ads_samples[i].data.ch4_mv,
+                              ads_samples[i].data.ch5_mv,
+                              ads_samples[i].data.ch6_mv,
+                              ads_samples[i].data.ch7_mv,
+                              ads_samples[i].data.ch8_mv);
+        write_to_session_file(csv_buffer, len);
+    }
+}
+void write_bhi_to_session_file(sample_sensor4_t* bhi_samples, uint8_t num) {
+    for (uint8_t i = 0; i < num; i++) {
+        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
+                              "%s,%u,%.4f,%.4f,%.4f\n",
+                              bhi_samples[i].sensor_name,
+                              bhi_samples[i].frame_id,
+                              (double)bhi_samples[i].data.pitch_deg,
+                              (double)bhi_samples[i].data.roll_deg,
+                              (double)bhi_samples[i].data.yaw_deg);
+        write_to_session_file(csv_buffer, len);
+    }
+}
+
+
+
+static uint8_t vl_buf[512];
+static uint8_t ads_buf[512];
+static uint8_t bhi_buf[512];
+static uint8_t sdp_buf[512];
+static void notify_sample_handler(struct k_timer *timer)
+{
+    if (!cpr_session_active) {
+        return;
+    }
+
+    // VL6180x
+    {
+        size_t bytes_read = ring_buf_get(&vl_ring, vl_buf, sizeof(vl_buf));
+        uint8_t num_samples = bytes_read / sizeof(sample_sensor1_t);
+        if (num_samples > 0) {
+            write_vl_to_session_file((sample_sensor1_t *)vl_buf, num_samples);
+        }
+    }
+
+    // SDP810
+    {
+        size_t bytes_read = ring_buf_get(&sdp_ring, sdp_buf, sizeof(sdp_buf));
+        uint8_t num_samples = bytes_read / sizeof(sample_sensor3_t);
+        if (num_samples > 0) {
+            write_sdp_to_session_file((sample_sensor3_t *)sdp_buf, num_samples);
+        }
+    }
+
+    // ADS7138
+    {
+        size_t bytes_read = ring_buf_get(&ads_ring, ads_buf, sizeof(ads_buf));
+        uint8_t num_samples = bytes_read / sizeof(sample_sensor2_t);
+        if (num_samples > 0) {
+            write_ads_to_session_file((sample_sensor2_t *)ads_buf, num_samples);
+        }
+    }
+
+    // BHI360
+    {
+        size_t bytes_read = ring_buf_get(&bhi_ring, bhi_buf, sizeof(bhi_buf));
+        uint8_t num_samples = bytes_read / sizeof(sample_sensor4_t);
+        if (num_samples > 0) {
+            write_bhi_to_session_file((sample_sensor4_t *)bhi_buf, num_samples);
+        }
+    }
+}
+
+static void sd_writer_thread_func(void *arg1, void *arg2, void *arg3)
+{
+    char line[CSV_LINE_MAX_LEN];
+
+    while (1) {
+        if (k_msgq_get(&csv_msgq, &line, K_FOREVER) == 0) {
+            if (cpr_session_active) {
+                ssize_t written = fs_write(&session_file, line, strlen(line));
+                if (written < 0) {
+                    printk("SD Write failed: %d\n", written);
+                }
+            }
+        }
+    }
+}
+
+
 int session_init() {
+    init_sdcard();
+    k_thread_create(&sd_writer_thread, sd_writer_stack,
+                K_THREAD_STACK_SIZEOF(sd_writer_stack),
+                sd_writer_thread_func, NULL, NULL, NULL,
+                5, 0, K_NO_WAIT);
+    k_thread_name_set(&sd_writer_thread, "sd_writer");
+
+    fs_file_t_init(&session_file);
     int err;
+    k_tid_t tid;
+    if (!device_is_ready(uart_dev))
+    {
+        printf("CDC ACM device not ready");
+        return 0;
+    }
+    usb_enable(NULL);
+    tid = k_thread_create(&cdc_read_thread_stack_data, cdc_read_thread_stack,
+                          K_THREAD_STACK_SIZEOF(cdc_read_thread_stack),
+                          cdc_read_thread, NULL, NULL, NULL,
+                          2, 0, K_NO_WAIT);
+    if (!tid)
+    {
+        printk("ERROR spawning rx thread\n");
+        return 0;
+    }
+    k_thread_name_set(tid, "rx_usb");
     printk("Bluetooth application with GATT service and Message Processor\n");
     LOG_INF("Starting Bluetooth application with GATT service and Message Processor");
     
@@ -1339,11 +1681,12 @@ int session_init() {
     
     /* Initialize notification timer */
     k_timer_init(&notify_timer, notify_timer_handler, NULL);
+    k_timer_init(&sample_timer, notify_sample_handler, NULL);
     
     /* Initialize LED timer to check for LED requests */
     k_timer_init(&led_timer, led_timer_handler, NULL);
     k_timer_start(&led_timer, K_MSEC(100), K_MSEC(100));  /* Check every 100ms */
-    
+    k_timer_start(&sample_timer, K_MSEC(20), K_MSEC(20));
     /* Initialize the advertising work queue item */
     k_work_init_delayable(&adv_work, advertising_work_handler);
     
@@ -1369,48 +1712,48 @@ int session_init() {
         LOG_ERR("Bluetooth init failed (err %d)", err);
     }
     
-    /* Test message processor with a simple command */
-    LOG_INF("Testing message processor with direct commands");
+    // /* Test message processor with a simple command */
+    // LOG_INF("Testing message processor with direct commands");
     
-    /* Wait a moment for everything to initialize */
-    k_sleep(K_SECONDS(2));
+    // /* Wait a moment for everything to initialize */
+    // k_sleep(K_SECONDS(2));
     
-    /* Submit test commands to control LED via message processor */
-    LOG_INF("Sending LED ON command to message processor");
-    submit_direct_command(CMD_CONTROL_LED_ON);
+    // /* Submit test commands to control LED via message processor */
+    // LOG_INF("Sending LED ON command to message processor");
+    // submit_direct_command(CMD_CONTROL_LED_ON);
     
-    k_sleep(K_SECONDS(2));
+    // k_sleep(K_SECONDS(2));
     
-    LOG_INF("Sending LED OFF command to message processor");
-    submit_direct_command(CMD_CONTROL_LED_OFF);
+    // LOG_INF("Sending LED OFF command to message processor");
+    // submit_direct_command(CMD_CONTROL_LED_OFF);
     
-    /* Test the BLE protocol formatting */
-    LOG_INF("Testing BLE protocol formatting");
-    test_ble_protocol();
+    // /* Test the BLE protocol formatting */
+    // LOG_INF("Testing BLE protocol formatting");
+    // test_ble_protocol();
     
-    /* Test CPR session commands */
-    k_sleep(K_SECONDS(2));
+    // /* Test CPR session commands */
+    // k_sleep(K_SECONDS(2));
     
-    LOG_INF("Sending CPR START command to message processor");
-    submit_direct_command(CPR_CONTROL_START);
+    // LOG_INF("Sending CPR START command to message processor");
+    // submit_direct_command(CPR_CONTROL_START);
     
-    k_sleep(K_SECONDS(5));
+    // k_sleep(K_SECONDS(5));
     
-    LOG_INF("Sending CPR STOP command to message processor");
-    submit_direct_command(CPR_COMMAND_STOP);
+    // LOG_INF("Sending CPR STOP command to message processor");
+    // submit_direct_command(CPR_COMMAND_STOP);
     
     /* Direct LED control test for verification */
-    k_sleep(K_SECONDS(2));
-    LOG_INF("Direct LED control test - ON");
-    led_on();
+    // k_sleep(K_SECONDS(2));
+    // LOG_INF("Direct LED control test - ON");
+    // led_on();
     
-    k_sleep(K_SECONDS(2));
-    LOG_INF("Direct LED control test - OFF");
-    led_off();
+    // k_sleep(K_SECONDS(2));
+    // LOG_INF("Direct LED control test - OFF");
+    // led_off();
     
     /* Wait for everything to initialize */
     k_sleep(K_SECONDS(2));
-    k_tid_t tid = k_thread_create(&ble_ios_thread_data, ble_ios_thread_stack,
+    tid = k_thread_create(&ble_ios_thread_data, ble_ios_thread_stack,
         K_THREAD_STACK_SIZEOF(ble_ios_thread_stack),
         ble_ios_task, NULL, NULL, NULL,
         2, 0, K_NO_WAIT);

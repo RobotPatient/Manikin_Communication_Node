@@ -31,5 +31,5 @@
     status = "okay";
     pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>; /* Adjust pins as needed */
     pinctrl-names = "default";
-    bus-speed = <125000>;
+    bus-speed = <5000000>;
 };
