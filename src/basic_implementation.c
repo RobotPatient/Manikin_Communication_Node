@@ -9,7 +9,6 @@ LOG_MODULE_REGISTER(basic_impl, LOG_LEVEL_INF);
 /* Simple timer callback for heartbeat */
 static void heartbeat_timer_callback(struct k_timer *timer)
 {
-    LOG_INF("Basic implementation heartbeat timer triggered");
 }
 
 /* Define a timer for heartbeat function */

@@ -21,7 +21,6 @@
 #define NOTIFY_TYPE_CPR_STATE      0x40    /* CPR session state change notification */
 #define NOTIFY_TYPE_USER_ROLE      0x50    /* User role notification */
 #define NOTIFY_TYPE_CPR_CMD_ACK    0x60    /* CPR command acknowledgment */
-#define NOTIFY_TYPE_CPR_DATA       0x70    /* CPR RAW data (from sensors) */
 
 /* Command types - aligned with protocol spec */
 /* These are already defined in message_processor.h, so don't redefine them here */

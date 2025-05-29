@@ -22,6 +22,7 @@
 #include "ble/ble_protocol.h"
 #include "ble_notifications.h"
 #include "can/can_transport.h"
+#include "sdcard/sdcard_module.h"
 /* External declaration for protocol test function */
 extern void test_ble_protocol(void);
 
@@ -32,18 +33,6 @@ extern void test_ble_protocol(void);
 #define BUF_SIZE 64
 #define START_CMD "start"
 #define STOP_CMD "stop"
-
-static size_t sd_buf_offset = 0;
-
-struct fs_file_t session_file;
-#define CSV_LINE_MAX_LEN 256
-#define CSV_QUEUE_SIZE 16 // Number of queued lines
-
-K_MSGQ_DEFINE(csv_msgq, CSV_LINE_MAX_LEN, CSV_QUEUE_SIZE, 4);
-K_MSGQ_DEFINE(csv_usb_msgq, CSV_LINE_MAX_LEN, CSV_QUEUE_SIZE, 4);
-
-K_THREAD_STACK_DEFINE(sd_writer_stack, 1024);
-static struct k_thread sd_writer_thread;
 
 LOG_MODULE_REGISTER(session, LOG_LEVEL_INF);
 
@@ -74,104 +63,6 @@ uint32_t get_cpr_session_time(void);
 /* Forward declaration of our notification helper functions */
 static int send_notification_safely(const void *data, uint16_t len);
 
-static FATFS fat_fs;
-static bool fs_mounted = false;
-
-#define DISK_DRIVE_NAME "SD"
-#define DISK_MOUNT_PT "/" DISK_DRIVE_NAME ":"
-#define FILE_PATH DISK_MOUNT_PT "/hello.txt"
-
-/* We use the generic filesystem API instead of FATFS directly */
-static struct fs_mount_t fat_fs_mnt = {
-    .type = FS_FATFS,
-    .fs_data = &fat_fs,
-    .mnt_point = "/SD:"};
-
-static int init_sdcard()
-{
-    struct fs_file_t file;
-    int ret;
-    /* raw disk i/o */
-    do
-    {
-        static const char *disk_pdrv = "SD";
-        uint64_t memory_size_mb;
-        uint32_t block_count;
-        uint32_t block_size;
-
-        if (disk_access_init(disk_pdrv) != 0)
-        {
-            printk("Storage init ERROR!");
-            break;
-        }
-
-        if (disk_access_ioctl(disk_pdrv,
-                              DISK_IOCTL_GET_SECTOR_COUNT, &block_count))
-        {
-            printk("Unable to get sector count");
-            break;
-        }
-        printk("Block count %u", block_count);
-
-        if (disk_access_ioctl(disk_pdrv,
-                              DISK_IOCTL_GET_SECTOR_SIZE, &block_size))
-        {
-            printk("Unable to get sector size");
-            break;
-        }
-        printk("Sector size %u", block_size);
-
-        memory_size_mb = (uint64_t)block_count * block_size;
-        printk("Memory Size(MB) %u", (uint32_t)(memory_size_mb >> 20));
-    } while (0);
-
-    int res = fs_mount(&fat_fs_mnt);
-
-    if (res == FR_OK)
-    {
-        fs_mounted = true;
-        printk("SD Card mounted.");
-        fs_file_t_init(&file);
-
-        // Try opening the file to check if it exists
-        ret = fs_open(&file, FILE_PATH, FS_O_READ);
-        if (ret < 0)
-        {
-            // File doesn't exist - create and write
-            printk("File doesn't exist. Creating and writing...\n");
-            ret = fs_open(&file, FILE_PATH, FS_O_CREATE | FS_O_WRITE);
-            if (ret < 0)
-            {
-                printk("Failed to create file: %d\n", ret);
-                return 1;
-            }
-
-            const char *msg = "Hello World\n";
-            ssize_t bytes_written = fs_write(&file, msg, strlen(msg));
-            printk("Wrote %d bytes\n", bytes_written);
-        }
-        else
-        {
-            // File exists - read content
-            char buffer[64];
-            ssize_t bytes_read = fs_read(&file, buffer, sizeof(buffer) - 1);
-            if (bytes_read > 0)
-            {
-                buffer[bytes_read] = '\0'; // null-terminate
-                printk("Read from file: %s", buffer);
-            }
-        }
-
-        fs_close(&file);
-        // lsdir(fat_fs_mnt.mnt_point);
-    }
-    else
-    {
-        printk("Error mounting disk.\n");
-        return 1;
-    }
-    return 0;
-}
 
 /* Helper function to prepare and send a notification using protocol format
  *
@@ -444,7 +335,7 @@ bool led_requested_state = false;
 
 /* CPR session timing - explicitly initialized to inactive */
 static uint32_t cpr_session_start_time = 0;
-static bool cpr_session_active = false; /* MUST remain false at startup */
+bool cpr_session_active = false; /* MUST remain false at startup */
 
 /* Function to check if CPR session is active */
 bool is_cpr_session_active(void)
@@ -743,6 +634,14 @@ static ssize_t ios_cmd_write(struct bt_conn *conn,
                 /* We don't log connection errors because they're expected when no device is connected */
                 LOG_ERR("Failed to send iOS command acknowledgment (err %d)", err);
             }
+            if(cmd_byte == CPR_CONTROL_START) {
+                start_cpr_session();
+                can_transmit_start_msg();
+            } else if (cmd_byte == CPR_CMD_STOP) {
+                stop_cpr_session();
+                can_transmit_stop_msg();
+            }
+
 
             return total_len;
         }
@@ -903,7 +802,29 @@ BT_GATT_SERVICE_DEFINE(custom_svc,
                                               BT_GATT_PERM_WRITE | BT_GATT_PERM_PREPARE_WRITE, /* Support long writes */
                                               NULL, ios_cmd_write, ios_cmd_buffer), );
 static struct k_work_delayable adv_work;
+#define DEVICE_NAME CONFIG_BT_DEVICE_NAME
+#define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
+#define ADV_LEN 12
+/* Advertising data */
+static uint8_t manuf_data[ADV_LEN] = {
+	0x01 /*SKD version */,
+	0x83 /* STM32WB - P2P Server 1 */,
+	0x00 /* GROUP A Feature  */,
+	0x00 /* GROUP A Feature */,
+	0x00 /* GROUP B Feature */,
+	0x00 /* GROUP B Feature */,
+	0x00, /* BLE MAC start -MSB */
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00, /* BLE MAC stop */
+};
 
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+	BT_DATA(BT_DATA_MANUFACTURER_DATA, manuf_data, ADV_LEN)};
 /* Robust advertising function with work queue handling */
 static void advertising_work_handler(struct k_work *work)
 {
@@ -926,9 +847,6 @@ static void advertising_work_handler(struct k_work *work)
 
     /* Minimal advertising data - just flags */
     static const uint8_t flag_data[] = {BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR};
-    static const struct bt_data minimal_ad[] = {
-        {BT_DATA_FLAGS, sizeof(flag_data), flag_data},
-    };
 
     /* Calculate backoff time based on retry count with exponential increase */
     if (retry_count == 0)
@@ -945,7 +863,7 @@ static void advertising_work_handler(struct k_work *work)
     }
 
     LOG_INF("Advertising attempt #%d", retry_count + 1);
-    int err = bt_le_adv_start(&param, minimal_ad, ARRAY_SIZE(minimal_ad), NULL, 0);
+    int err = bt_le_adv_start(&param, ad, ARRAY_SIZE(ad), NULL, 0);
 
     if (err)
     {
@@ -1488,155 +1406,6 @@ static void led_timer_handler(struct k_timer *timer)
     }
 }
 
-K_THREAD_STACK_DEFINE(ble_ios_thread_stack, 1024);
-struct k_thread ble_ios_thread_data;
-
-void ble_ios_task(void *arg1, void *arg2, void *arg3)
-{
-    while (1)
-    {
-        char time_buffer[24] = {0};
-        char rtc_time[24] = {0};
-
-        /* First get and display raw time data */
-        if (has_received_time_data())
-        {
-            size_t time_len = get_time_data(time_buffer, sizeof(time_buffer));
-            if (time_len > 0)
-            {
-                /* Format time data for display: YYYYMMDDHHMMSS -> YYYY-MM-DD HH:MM:SS */
-                char formatted_time[24] = {0};
-                if (time_len >= 14)
-                {
-                    snprintf(formatted_time, sizeof(formatted_time),
-                             "%.4s-%.2s-%.2s %.2s:%.2s:%.2s",
-                             time_buffer, time_buffer + 4, time_buffer + 6,
-                             time_buffer + 8, time_buffer + 10, time_buffer + 12);
-                    // LOG_INF("Heartbeat - Raw time data: %s", formatted_time);
-                }
-                else
-                {
-                    LOG_INF("Heartbeat - Raw time data available but invalid format: %s", time_buffer);
-                }
-            }
-            else
-            {
-                LOG_INF("Heartbeat - Raw time data empty");
-            }
-        }
-        else
-        {
-            LOG_INF("Heartbeat - No raw time data received yet");
-        }
-
-        /* Now get and display formatted RTC time */
-        size_t rtc_len = get_rtc_time(rtc_time, sizeof(rtc_time));
-        if (rtc_len > 0)
-        {
-            LOG_INF("====== CURRENT TIME: %s ======", rtc_time);
-        }
-        else
-        {
-            LOG_INF("====== RTC TIME NOT AVAILABLE ======");
-        }
-
-        /* Get user role information */
-        uint8_t role = get_user_role();
-        if (role != USER_ROLE_NONE)
-        {
-            char id_buffer[20] = {0};
-            if (role == USER_ROLE_INSTRUCTOR)
-            {
-                get_instructor_id(id_buffer, sizeof(id_buffer));
-                LOG_INF("Heartbeat - Role: Instructor, ID: %s", id_buffer);
-            }
-            else if (role == USER_ROLE_TRAINEE)
-            {
-                get_trainee_id(id_buffer, sizeof(id_buffer));
-                LOG_INF("Heartbeat - Role: Trainee, ID: %s", id_buffer);
-            }
-        }
-        else
-        {
-            LOG_INF("Heartbeat - No user role set");
-        }
-
-        /* Periodically display CPR session state - only log every 5 seconds to reduce noise */
-        static uint32_t last_cpr_log_time = 0;
-        uint32_t now = k_uptime_get_32();
-        if (now - last_cpr_log_time >= 5000)
-        {
-            last_cpr_log_time = now;
-
-            if (cpr_session_active)
-            {
-                /* Get current CPR session time and display it */
-                uint32_t elapsed_sec = get_cpr_session_time();
-                uint32_t minutes = elapsed_sec / 60;
-                uint32_t seconds = elapsed_sec % 60;
-
-                LOG_INF("****** CPR SESSION ACTIVE - %02d:%02d elapsed ******", minutes, seconds);
-            }
-            else
-            {
-                LOG_INF("------ No CPR session active ------");
-            }
-        }
-
-        /* No automatic CPR session start/stop - controlled only by commands */
-
-        /* Make sure we can receive instructor ID commands */
-        static bool sent_id = false;
-        if (!sent_id && k_uptime_get_32() > 10000)
-        { /* After 10 seconds */
-            const char *test_id = "in:test123";
-            LOG_INF("Sending test instructor ID: %s", test_id);
-            submit_command((const uint8_t *)test_id, strlen(test_id));
-            sent_id = true;
-        }
-
-        /* After 15 seconds, send a test time data command */
-        static bool sent_time = false;
-        if (!sent_time && k_uptime_get_32() > 15000)
-        {
-            LOG_INF("Sending test time data: 20250506150722");
-
-            /* Use the new protocol formatting */
-            const char *time_data = "20250506150722";
-            uint8_t time_cmd[32];
-
-            int cmd_len = format_timedata_command(time_cmd, sizeof(time_cmd),
-                                                  time_data, strlen(time_data));
-
-            if (cmd_len > 0)
-            {
-                LOG_INF("Formatted time data command using protocol, length: %d bytes", cmd_len);
-                LOG_HEXDUMP_INF(time_cmd, cmd_len, "Formatted time data command");
-                submit_command(time_cmd, cmd_len);
-            }
-            else
-            {
-                LOG_ERR("Failed to format time data command: %d", cmd_len);
-
-                /* Fall back to old format for backward compatibility */
-                uint8_t old_time_cmd[] = {
-                    MSG_COMMAND_BYTE_START,                                               /* Start byte */
-                    MSG_COMMAND_MSG_COLON,                                                /* Command separator */
-                    CMD_COMMAND_TIMEDATA,                                                 /* Time data command */
-                    MSG_COMMAND_MSG_COLON,                                                /* Data separator */
-                    '2', '0', '2', '5', '0', '5', '0', '6', '1', '5', '0', '7', '2', '2', /* Time data */
-                    MSG_COMMAND_MSG_END                                                   /* End byte */
-                };
-
-                submit_command(old_time_cmd, sizeof(old_time_cmd));
-            }
-
-            sent_time = true;
-        }
-
-        k_sleep(K_SECONDS(2));
-    }
-}
 
 void process_command(const char *cmd)
 {
@@ -1655,7 +1424,9 @@ void process_command(const char *cmd)
         can_transmit_stop_msg();
     }
 }
-
+#define CSV_QUEUE_SIZE 16 // Number of queued lines
+#define CSV_LINE_MAX_LEN 256
+K_MSGQ_DEFINE(csv_usb_msgq, CSV_LINE_MAX_LEN, CSV_QUEUE_SIZE, 4);
 void cdc_write_thread(void *arg1, void *arg2, void *arg3)
 {
     char line[CSV_LINE_MAX_LEN];
@@ -1695,93 +1466,6 @@ void cdc_read_thread(void *arg1, void *arg2, void *arg3)
             }
         }
         k_msleep(10);
-    }
-}
-
-char csv_buffer[256]; // 1024 is excessive for a single row
-
-void write_to_session_file(char *csv_formatted_text, size_t length)
-{
-    if (!cpr_session_active)
-    {
-        printk("Session not active, skipping queue.\n");
-        return;
-    }
-
-    if (length >= CSV_LINE_MAX_LEN)
-    {
-        printk("Line too long to queue\n");
-        return;
-    }
-
-    if (k_msgq_put(&csv_msgq, csv_formatted_text, K_NO_WAIT) != 0)
-    {
-        printk("CSV queue full, dropping sample\n");
-    }
-
-    if (k_msgq_put(&csv_usb_msgq, csv_formatted_text, K_NO_WAIT) != 0)
-    {
-        printk("CSV queue full, dropping sample\n");
-    }
-}
-
-void write_vl_to_session_file(sample_sensor1_t *vl_samples, uint8_t num)
-{
-    for (uint8_t i = 0; i < num; i++)
-    {
-        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
-                              "%s,%u,%d\n",
-                              vl_samples[i].sensor_name,
-                              vl_samples[i].frame_id,
-                              vl_samples[i].data.distance_mm);
-        write_to_session_file(csv_buffer, len);
-    }
-}
-
-void write_sdp_to_session_file(sample_sensor3_t *sdp_samples, uint8_t num)
-{
-    for (uint8_t i = 0; i < num; i++)
-    {
-        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
-                              "%s,%u,%.4f,%.4f\n",
-                              sdp_samples[i].sensor_name,
-                              sdp_samples[i].frame_id,
-                              (double)sdp_samples[i].data.pressure,
-                              (double)sdp_samples[i].data.temp);
-        write_to_session_file(csv_buffer, len);
-    }
-}
-void write_ads_to_session_file(sample_sensor2_t *ads_samples, uint8_t num)
-{
-    for (uint8_t i = 0; i < num; i++)
-    {
-        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
-                              "%s,%u,%d,%d,%d,%d,%d,%d,%d,%d\n",
-                              ads_samples[i].sensor_name,
-                              ads_samples[i].frame_id,
-                              ads_samples[i].data.ch1_mv,
-                              ads_samples[i].data.ch2_mv,
-                              ads_samples[i].data.ch3_mv,
-                              ads_samples[i].data.ch4_mv,
-                              ads_samples[i].data.ch5_mv,
-                              ads_samples[i].data.ch6_mv,
-                              ads_samples[i].data.ch7_mv,
-                              ads_samples[i].data.ch8_mv);
-        write_to_session_file(csv_buffer, len);
-    }
-}
-void write_bhi_to_session_file(sample_sensor4_t *bhi_samples, uint8_t num)
-{
-    for (uint8_t i = 0; i < num; i++)
-    {
-        size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
-                              "%s,%u,%.4f,%.4f,%.4f\n",
-                              bhi_samples[i].sensor_name,
-                              bhi_samples[i].frame_id,
-                              (double)bhi_samples[i].data.pitch_deg,
-                              (double)bhi_samples[i].data.roll_deg,
-                              (double)bhi_samples[i].data.yaw_deg);
-        write_to_session_file(csv_buffer, len);
     }
 }
 
@@ -1837,34 +1521,9 @@ static void notify_sample_handler(struct k_timer *timer)
     }
 }
 
-static void sd_writer_thread_func(void *arg1, void *arg2, void *arg3)
-{
-    char line[CSV_LINE_MAX_LEN];
-
-    while (1)
-    {
-        if (k_msgq_get(&csv_msgq, &line, K_FOREVER) == 0)
-        {
-            if (cpr_session_active)
-            {
-                ssize_t written = fs_write(&session_file, line, strlen(line));
-                if (written < 0)
-                {
-                    printk("SD Write failed: %d\n", written);
-                }
-            }
-        }
-    }
-}
-
 int session_init()
 {
     init_sdcard();
-    k_thread_create(&sd_writer_thread, sd_writer_stack,
-                    K_THREAD_STACK_SIZEOF(sd_writer_stack),
-                    sd_writer_thread_func, NULL, NULL, NULL,
-                    5, 0, K_NO_WAIT);
-    k_thread_name_set(&sd_writer_thread, "sd_writer");
 
     fs_file_t_init(&session_file);
     int err;
@@ -1953,57 +1612,6 @@ int session_init()
         LOG_ERR("Bluetooth init failed (err %d)", err);
     }
 
-    // /* Test message processor with a simple command */
-    // LOG_INF("Testing message processor with direct commands");
-
-    // /* Wait a moment for everything to initialize */
-    // k_sleep(K_SECONDS(2));
-
-    // /* Submit test commands to control LED via message processor */
-    // LOG_INF("Sending LED ON command to message processor");
-    // submit_direct_command(CMD_CONTROL_LED_ON);
-
-    // k_sleep(K_SECONDS(2));
-
-    // LOG_INF("Sending LED OFF command to message processor");
-    // submit_direct_command(CMD_CONTROL_LED_OFF);
-
-    // /* Test the BLE protocol formatting */
-    // LOG_INF("Testing BLE protocol formatting");
-    // test_ble_protocol();
-
-    // /* Test CPR session commands */
-    // k_sleep(K_SECONDS(2));
-
-    // LOG_INF("Sending CPR START command to message processor");
-    // submit_direct_command(CPR_CONTROL_START);
-
-    // k_sleep(K_SECONDS(5));
-
-    // LOG_INF("Sending CPR STOP command to message processor");
-    // submit_direct_command(CPR_COMMAND_STOP);
-
-    /* Direct LED control test for verification */
-    // k_sleep(K_SECONDS(2));
-    // LOG_INF("Direct LED control test - ON");
-    // led_on();
-
-    // k_sleep(K_SECONDS(2));
-    // LOG_INF("Direct LED control test - OFF");
-    // led_off();
-
-    /* Wait for everything to initialize */
-    k_sleep(K_SECONDS(2));
-    tid = k_thread_create(&ble_ios_thread_data, ble_ios_thread_stack,
-                          K_THREAD_STACK_SIZEOF(ble_ios_thread_stack),
-                          ble_ios_task, NULL, NULL, NULL,
-                          2, 0, K_NO_WAIT);
-    if (!tid)
-    {
-        printk("ERROR spawning rx thread\n");
-        return 0;
-    }
-    k_thread_name_set(tid, "ble_ios_task");
     return 0;
 }
 
