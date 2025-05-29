@@ -14,7 +14,7 @@ LOG_MODULE_REGISTER(sdcard_module, LOG_LEVEL_INF);
 #define CSV_QUEUE_SIZE 16
 
 #define CSV_LINE_MAX_LEN 256
-#define CSV_QUEUE_SIZE 16 // Number of queued lines
+#define CSV_QUEUE_SIZE 25 // Number of queued lines
 K_MSGQ_DEFINE(csv_msgq, CSV_LINE_MAX_LEN, CSV_QUEUE_SIZE, 4);
 
 extern struct k_msgq csv_usb_msgq;
@@ -132,6 +132,7 @@ void write_vl_to_session_file(sample_sensor1_t *vl_samples, uint8_t num)
 {
     for (uint8_t i = 0; i < num; i++)
     {
+        memset(csv_buffer, 0x00, sizeof(csv_buffer));
         size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
                               "%s,%u,%d\n",
                               vl_samples[i].sensor_name,
@@ -145,6 +146,7 @@ void write_ads_to_session_file(sample_sensor2_t *ads_samples, uint8_t num)
 {
     for (uint8_t i = 0; i < num; i++)
     {
+        memset(csv_buffer, 0x00, sizeof(csv_buffer));
         size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
                               "%s,%u,%d,%d,%d,%d,%d,%d,%d,%d\n",
                               ads_samples[i].sensor_name,
@@ -165,6 +167,7 @@ void write_sdp_to_session_file(sample_sensor3_t *sdp_samples, uint8_t num)
 {
     for (uint8_t i = 0; i < num; i++)
     {
+        memset(csv_buffer, 0x00, sizeof(csv_buffer));
         size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
                               "%s,%u,%.4f,%.4f\n",
                               sdp_samples[i].sensor_name,
@@ -179,6 +182,7 @@ void write_bhi_to_session_file(sample_sensor4_t *bhi_samples, uint8_t num)
 {
     for (uint8_t i = 0; i < num; i++)
     {
+        memset(csv_buffer, 0x00, sizeof(csv_buffer));
         size_t len = snprintf(csv_buffer, sizeof(csv_buffer),
                               "%s,%u,%.4f,%.4f,%.4f\n",
                               bhi_samples[i].sensor_name,

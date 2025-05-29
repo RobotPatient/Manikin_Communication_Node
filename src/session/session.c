@@ -23,6 +23,8 @@
 #include "ble_notifications.h"
 #include "can/can_transport.h"
 #include "sdcard/sdcard_module.h"
+#include "led_handler.h"
+
 /* External declaration for protocol test function */
 extern void test_ble_protocol(void);
 
@@ -61,7 +63,7 @@ void stop_cpr_session(void);
 uint32_t get_cpr_session_time(void);
 
 /* Forward declaration of our notification helper functions */
-static int send_notification_safely(const void *data, uint16_t len);
+int send_notification_safely(const void *data, uint16_t len);
 
 
 /* Helper function to prepare and send a notification using protocol format
@@ -80,7 +82,7 @@ static int send_notification_safely(const void *data, uint16_t len);
  *
  * - For command acknowledgments, use send_command_ack() instead
  */
-static int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t payload_len)
+int send_ble_notification(uint8_t msg_type, const void *payload, uint16_t payload_len)
 {
     /* Calculate the total required buffer size:
      * START_BYTE(1) + LENGTH_BYTE(1) + COLON(1) + MSG_TYPE(1) + PAYLOAD(payload_len) + SEMICOLON(1) + END_BYTE(1)
@@ -156,7 +158,7 @@ static int send_command_ack(uint8_t cmd_byte)
  */
 
 /* Helper function for checking connection and sending notifications */
-static int send_notification_safely(const void *data, uint16_t len)
+int send_notification_safely(const void *data, uint16_t len)
 {
     /* Index 4 is the notification characteristic value attribute, from counting in service definition */
     static const int NOTIFY_CHAR_INDEX = 4;
@@ -301,11 +303,11 @@ static int send_notification_safely(const void *data, uint16_t len)
 }
 
 /* Constants moved to ble_notifications.h */
-static bool notify_enabled = false;
+bool notify_enabled = false;
 static bool connection_notif_reset_needed = true; /* Track when we need to reset notification states */
 
 /* Per-connection tracking for notification support */
-static struct
+struct
 {
     bool heartbeat_works;
     bool role_works;
@@ -318,7 +320,7 @@ static struct
 extern volatile bool stream_notify_enable;
 
 /* Always allow CPR notifications, even if standard notifications aren't enabled */
-static bool cpr_notifications_allowed = true;
+bool cpr_notifications_allowed = true;
 
 /* External function from basic_implementation.c */
 void basic_implementation_init(void);
@@ -334,7 +336,7 @@ bool led_request_pending = false;
 bool led_requested_state = false;
 
 /* CPR session timing - explicitly initialized to inactive */
-static uint32_t cpr_session_start_time = 0;
+uint32_t cpr_session_start_time = 0;
 bool cpr_session_active = false; /* MUST remain false at startup */
 
 /* Function to check if CPR session is active */
@@ -1005,408 +1007,11 @@ static struct bt_conn_cb conn_callbacks = {
     .disconnected = disconnected,
 };
 
-/* Timer to check for LED requests from message processor */
-static struct k_timer led_timer;
 
 /* Forward declaration for advertising timer */
 static void start_adv_with_delay(void);
 
 /* LED timer handler */
-static void led_timer_handler(struct k_timer *timer)
-{
-    /* Check if there's a pending LED request */
-    if (led_request_pending)
-    {
-        led_request_pending = false;
-        LOG_INF("Processing LED request: %s", led_requested_state ? "ON" : "OFF");
-
-        /* Control the physical LED */
-        if (led_requested_state)
-        {
-            led_on(); /* Turn LED on using the LED service */
-        }
-        else
-        {
-            led_off(); /* Turn LED off using the LED service */
-        }
-
-        LOG_INF("LED is now %s", led_requested_state ? "ON" : "OFF");
-
-        /* Send a notification if notifications are enabled */
-        if (notify_enabled)
-        {
-            uint8_t led_state = led_requested_state ? 0x01 : 0x00;
-
-            int err = send_ble_notification(NOTIFY_TYPE_LED_STATE, &led_state, sizeof(led_state));
-
-            /* Only log success or non-connection errors */
-            if (err == 0)
-            {
-                LOG_INF("LED state notification sent: %d", led_requested_state);
-            }
-            else if (err != -ENOTCONN && err != -ENOTSUP)
-            {
-                /* We don't log connection errors because they're expected when no device is connected */
-                LOG_ERR("LED state notification failed (err %d)", err);
-            }
-        }
-    }
-
-    /* Check CPR session status and track elapsed time */
-    uint32_t now = k_uptime_get_32();
-
-    /* Update CPR session time if active */
-    if (is_cpr_session_active())
-    {
-        uint32_t elapsed_seconds = get_cpr_session_time();
-
-        /* Log CPR session time every 5 seconds */
-        if (elapsed_seconds % 5 == 0 && elapsed_seconds > 0)
-        {
-            uint32_t minutes = elapsed_seconds / 60;
-            uint32_t seconds = elapsed_seconds % 60;
-            LOG_INF("CPR Session Time: %02d:%02d (elapsed seconds: %u)",
-                    minutes, seconds, elapsed_seconds);
-
-            /* If notifications are enabled or CPR notifications allowed, and we have a valid, ready connection */
-            uint32_t now = k_uptime_get_32();
-            bool connection_ready = (now - connection_time) >= connection_ready_delay;
-
-            if ((notify_enabled || cpr_notifications_allowed) && is_connected && current_conn && connection_ready)
-            {
-                /* Format time in MM:SS format */
-                uint32_t minutes = elapsed_seconds / 60;
-                uint32_t seconds = elapsed_seconds % 60;
-
-                /* Create a payload with [ELAPSED_SEC][TIME_STR] */
-                uint8_t payload[32]; /* Increased size to handle protocol overhead */
-
-                /* Add elapsed time as 32-bit value */
-                payload[0] = (elapsed_seconds >> 24) & 0xFF;
-                payload[1] = (elapsed_seconds >> 16) & 0xFF;
-                payload[2] = (elapsed_seconds >> 8) & 0xFF;
-                payload[3] = elapsed_seconds & 0xFF;
-
-                /* Add formatted time string "cpr:MM:SS" */
-                char time_str[16]; /* Increased buffer size to avoid truncation warnings */
-                snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
-                size_t str_len = strlen(time_str);
-
-                /* Copy the string to the payload */
-                memcpy(&payload[4], time_str, str_len);
-
-                /* Send notification with both binary time and human-readable format */
-                int err = send_ble_notification(NOTIFY_TYPE_CPR_TIME, payload, 4 + str_len);
-
-                /* Only log success or non-connection errors */
-                if (err == 0)
-                {
-                    LOG_DBG("CPR session time notification sent: %s (%u seconds)",
-                            time_str, elapsed_seconds);
-                }
-                else if (err != -ENOTCONN && err != -ENOTSUP)
-                {
-                    /* We don't log connection errors because they're expected when no device is connected */
-                    LOG_ERR("CPR session time notification failed (err %d)", err);
-                }
-            }
-        }
-    }
-
-    /* Track CPR session state changes and command acknowledgments */
-    static bool last_notified_state = false;
-    static bool start_ack_sent = false;
-    static bool stop_ack_sent = false;
-    static uint32_t session_stop_time = 0;
-
-    /* Handle CPR state changes first */
-    if (last_notified_state != cpr_session_active)
-    {
-        LOG_INF("CPR session state changed for notification: %d -> %d",
-                last_notified_state, cpr_session_active);
-
-        /* Update state tracking */
-        if (cpr_session_active && !last_notified_state)
-        {
-            /* Session just activated - reset acknowledgment flags */
-            start_ack_sent = false;
-            stop_ack_sent = true; /* Don't send stop ack yet */
-        }
-        else if (!cpr_session_active && last_notified_state)
-        {
-            /* Session just stopped - record stop time for stop ack */
-            session_stop_time = now;
-            start_ack_sent = true; /* Don't send start ack anymore */
-            stop_ack_sent = false; /* Need to send stop ack */
-        }
-
-        /* Send state change notification only if we have a valid and ready connection */
-        uint32_t now = k_uptime_get_32();
-        bool connection_ready = (now - connection_time) >= connection_ready_delay;
-
-        if ((notify_enabled || cpr_notifications_allowed) && is_connected && current_conn && connection_ready)
-        {
-            if (cpr_session_active)
-            {
-                /* Just need to send a single byte with state value */
-                uint8_t state = 0x01; /* State: Active */
-
-                int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
-
-                /* Only log success or non-connection errors */
-                if (err == 0)
-                {
-                    LOG_INF("CPR session ACTIVE state notification sent successfully");
-                    last_notified_state = cpr_session_active; /* Update notified state */
-                }
-                else if (err != -ENOTCONN && err != -ENOTSUP)
-                {
-                    /* We don't log connection errors because they're expected when no device is connected */
-                    LOG_ERR("CPR session ACTIVE state notification failed (err %d)", err);
-                    /* Don't update state so we'll try again next time */
-                }
-            }
-            else
-            {
-                /* Just need to send a single byte with state value */
-                uint8_t state = 0x00; /* State: Inactive */
-
-                int err = send_ble_notification(NOTIFY_TYPE_CPR_STATE, &state, sizeof(state));
-
-                /* Only log success or non-connection errors */
-                if (err == 0)
-                {
-                    LOG_INF("CPR session INACTIVE state notification sent successfully");
-                    last_notified_state = cpr_session_active; /* Update notified state */
-                }
-                else if (err != -ENOTCONN && err != -ENOTSUP)
-                {
-                    /* We don't log connection errors because they're expected when no device is connected */
-                    LOG_ERR("CPR session INACTIVE state notification failed (err %d)", err);
-                    /* Don't update state so we'll try again next time */
-                }
-            }
-        }
-        else
-        {
-            LOG_INF("BLE notifications not enabled, no state notification sent");
-            last_notified_state = cpr_session_active; /* Update even if no notification is sent */
-        }
-    }
-
-    /* Now handle command acknowledgments - only if we have a valid and ready connection */
-    uint32_t now_timer = k_uptime_get_32();
-    bool connection_ready = (now_timer - connection_time) >= connection_ready_delay;
-
-    if ((notify_enabled || cpr_notifications_allowed) && is_connected && current_conn && connection_ready)
-    {
-        /* Send start acknowledgment when first starting */
-        if (cpr_session_active && !start_ack_sent)
-        {
-            /* Calculate elapsed time (should be close to 0) */
-            uint32_t elapsed_sec = get_cpr_session_time();
-            uint32_t minutes = elapsed_sec / 60;
-            uint32_t seconds = elapsed_sec % 60;
-
-            /* Prepare a payload with command details and formatted time */
-            uint8_t payload[32]; /* Increased size to handle protocol overhead */
-
-            payload[0] = CPR_CMD_START; /* Command: Start CPR */
-            payload[1] = STATUS_OK;     /* Status: OK */
-
-            /* Add formatted time string "cpr:MM:SS" */
-            char time_str[16]; /* Increased buffer size to avoid truncation warnings */
-            snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
-            size_t str_len = strlen(time_str);
-
-            /* Copy the string to the payload */
-            memcpy(&payload[2], time_str, str_len);
-
-            /* Send notification with command details and time string */
-            int err = send_ble_notification(NOTIFY_TYPE_CPR_CMD_ACK, payload, 2 + str_len);
-
-            /* Only log success or non-connection errors */
-            if (err == 0)
-            {
-                LOG_INF("CPR START command acknowledgment sent: OK with time %s", time_str);
-                start_ack_sent = true;
-            }
-            else if (err != -ENOTCONN && err != -ENOTSUP)
-            {
-                /* We don't log connection errors because they're expected when no device is connected */
-                LOG_ERR("CPR start acknowledgment failed (err %d)", err);
-                /* Don't mark as sent so we'll retry later */
-            }
-        }
-
-        /* Send stop acknowledgment when stopped */
-        if (!cpr_session_active && !stop_ack_sent)
-        {
-            /* Calculate session duration if we have valid times */
-            uint32_t elapsed_sec = 0;
-            if (session_stop_time > cpr_session_start_time && cpr_session_start_time > 0)
-            {
-                uint32_t elapsed_ms = session_stop_time - cpr_session_start_time;
-                elapsed_sec = elapsed_ms / 1000;
-            }
-
-            /* Format elapsed time for human-readable format */
-            uint32_t minutes = elapsed_sec / 60;
-            uint32_t seconds = elapsed_sec % 60;
-
-            /* Prepare a payload with command details, duration, and formatted time */
-            uint8_t payload[32]; /* Increased size to handle protocol overhead */
-
-            payload[0] = CPR_CMD_STOP; /* Command: Stop CPR */
-            payload[1] = STATUS_OK;    /* Status: OK */
-
-            /* Format binary duration as well */
-            payload[2] = (elapsed_sec >> 8) & 0xFF; /* Duration high byte */
-            payload[3] = elapsed_sec & 0xFF;        /* Duration low byte */
-
-            /* Add formatted time string "cpr:MM:SS" */
-            char time_str[16]; /* Increased buffer size to avoid truncation warnings */
-            snprintf(time_str, sizeof(time_str), "cpr:%02d:%02d", minutes, seconds);
-            size_t str_len = strlen(time_str);
-
-            /* Copy the string to the payload */
-            memcpy(&payload[4], time_str, str_len);
-
-            /* Send notification with command details, duration, and time string */
-            int err = send_ble_notification(NOTIFY_TYPE_CPR_CMD_ACK, payload, 4 + str_len);
-
-            /* Only log success or non-connection errors */
-            if (err == 0)
-            {
-                LOG_INF("CPR STOP command acknowledgment sent: OK with time %s (%u seconds)",
-                        time_str, elapsed_sec);
-                stop_ack_sent = true;
-            }
-            else if (err != -ENOTCONN && err != -ENOTSUP)
-            {
-                /* We don't log connection errors because they're expected when no device is connected */
-                LOG_ERR("CPR stop acknowledgment failed (err %d)", err);
-                /* Don't mark as sent so we'll retry later */
-            }
-        }
-    }
-
-    /* Periodically check if we have user role data to report */
-    static uint32_t last_role_check = 0;
-
-    if (now - last_role_check > 5000)
-    { /* Check every 5 seconds */
-        last_role_check = now;
-
-        uint8_t role = get_user_role();
-        /* Check notification state AND connection status */
-        if (role != USER_ROLE_NONE && notify_enabled &&
-            is_connected && current_conn && (now - connection_time) >= connection_ready_delay)
-        {
-            /* Prepare a structured notification with user role info */
-            char id_buffer[20];
-
-            /* Get the ID string based on role */
-            size_t id_len = 0;
-            if (role == USER_ROLE_INSTRUCTOR)
-            {
-                id_len = get_instructor_id(id_buffer, sizeof(id_buffer));
-            }
-            else if (role == USER_ROLE_TRAINEE)
-            {
-                id_len = get_trainee_id(id_buffer, sizeof(id_buffer));
-            }
-
-            /* Add ID to notification if we have one */
-            if (id_len > 0)
-            {
-                /* Prepare payload with role and ID */
-                uint8_t payload[32]; /* Increased size to handle protocol overhead */
-
-                payload[0] = role;            /* Role: 1=Instructor, 2=Trainee */
-                payload[1] = (uint8_t)id_len; /* Length of ID string */
-                memcpy(&payload[2], id_buffer, id_len);
-
-                /* Use global notification support tracking */
-                static uint32_t last_role_attempt = 0;
-
-                /* Only try sending if it's worked before or we haven't tried in a while */
-                if (notification_support.role_works || (now - last_role_attempt > 60000))
-                {
-                    last_role_attempt = now;
-
-                    /* Try to send notification with role data */
-                    int err = send_ble_notification(NOTIFY_TYPE_USER_ROLE, payload, 2 + id_len);
-
-                    if (err == 0)
-                    {
-                        LOG_INF("User role notification sent: role=%d, id=%s", role, id_buffer);
-                        notification_support.role_works = true;
-                    }
-                    else if (err == -ENOTSUP)
-                    {
-                        /* This iOS client doesn't support role notifications, turn them off */
-                        notification_support.role_works = false;
-                        LOG_INF("User role notifications disabled - not supported by client");
-                    }
-                    else if (err != -ENOTCONN)
-                    {
-                        /* Log other non-connection errors */
-                        LOG_ERR("User role notification failed (err %d)", err);
-                    }
-                }
-            }
-        }
-
-        /* Also check for time data - verify both notifications AND connection status */
-        if (has_received_time_data() && notify_enabled &&
-            is_connected && current_conn && (now - connection_time) >= connection_ready_delay)
-        {
-            char time_buffer[20];
-            size_t time_len = get_time_data(time_buffer, sizeof(time_buffer));
-
-            if (time_len > 0)
-            {
-                /* Prepare payload with time data */
-                uint8_t payload[32]; /* Increased size to handle protocol overhead */
-
-                payload[0] = (uint8_t)time_len; /* Length of time data */
-                memcpy(&payload[1], time_buffer, time_len);
-
-                /* Use global notification support tracking */
-                static uint32_t last_attempt_time = 0;
-
-                /* Only try sending if it's worked before or we haven't tried in a while */
-                if (notification_support.time_works || (now - last_attempt_time > 60000))
-                {
-                    last_attempt_time = now;
-
-                    /* Try to send notification with time data */
-                    int err = send_ble_notification(NOTIFY_TYPE_TIME_DATA, payload, 1 + time_len);
-
-                    if (err == 0)
-                    {
-                        LOG_INF("Time data notification sent: %s", time_buffer);
-                        notification_support.time_works = true;
-                    }
-                    else if (err == -ENOTSUP)
-                    {
-                        /* This iOS client doesn't support time data notifications, turn them off */
-                        notification_support.time_works = false;
-                        LOG_INF("Time data notifications disabled - not supported by client");
-                    }
-                    else if (err != -ENOTCONN)
-                    {
-                        /* Log other non-connection errors */
-                        LOG_ERR("Time data notification failed (err %d)", err);
-                    }
-                }
-            }
-        }
-    }
-}
-
-
 void process_command(const char *cmd)
 {
     if (strncmp(cmd, START_CMD, strlen(START_CMD)) == 0)
@@ -1424,27 +1029,24 @@ void process_command(const char *cmd)
         can_transmit_stop_msg();
     }
 }
-#define CSV_QUEUE_SIZE 16 // Number of queued lines
+#define CSV_QUEUE_SIZE 25 // Number of queued lines
 #define CSV_LINE_MAX_LEN 256
+char line[128];
 K_MSGQ_DEFINE(csv_usb_msgq, CSV_LINE_MAX_LEN, CSV_QUEUE_SIZE, 4);
 void cdc_write_thread(void *arg1, void *arg2, void *arg3)
 {
-    char line[CSV_LINE_MAX_LEN];
     int written = 0;
-    while (1)
-    {
-        if (k_msgq_get(&csv_usb_msgq, &line, K_FOREVER) == 0)
-        {
-            if (cpr_session_active)
-            {
-                written = uart_fifo_fill(uart_dev, line, sizeof(line));
-                if (written < 0)
-                {
-                    printk("USB Write failed: %d\n", written);
-                }
+while (1) {
+    if (k_msgq_get(&csv_usb_msgq, &line, K_MSEC(1)) == 0) {
+        if (cpr_session_active) {
+            written = uart_fifo_fill(uart_dev, line, strlen(line));
+            if (written < 0) {
+                printk("USB Write failed: %d\n", written);
             }
         }
     }
+}
+
 }
 
 void cdc_read_thread(void *arg1, void *arg2, void *arg3)
@@ -1574,15 +1176,13 @@ int session_init()
         k_sleep(K_MSEC(500));
         led_off();
     }
+    led_handler_init();
 
     /* Initialize notification timer */
     k_timer_init(&notify_timer, notify_timer_handler, NULL);
     k_timer_init(&sample_timer, notify_sample_handler, NULL);
+    k_timer_start(&sample_timer, K_MSEC(10), K_MSEC(10));
 
-    /* Initialize LED timer to check for LED requests */
-    k_timer_init(&led_timer, led_timer_handler, NULL);
-    k_timer_start(&led_timer, K_MSEC(100), K_MSEC(100)); /* Check every 100ms */
-    k_timer_start(&sample_timer, K_MSEC(20), K_MSEC(20));
     /* Initialize the advertising work queue item */
     k_work_init_delayable(&adv_work, advertising_work_handler);
 

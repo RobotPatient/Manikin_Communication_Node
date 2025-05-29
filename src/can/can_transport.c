@@ -105,7 +105,7 @@ void rx_sensorhub2_sensor1_thread(void *arg1, void *arg2, void *arg3)
     ARG_UNUSED(arg2);
     ARG_UNUSED(arg3);
     int ret, received_len;
-    static uint8_t rx_buffer[128];
+    static uint8_t rx_buffer[256];
 
     ret = isotp_bind(&recv_ctx_sensorhub2_sensor1, can_dev,
                      &tx_sensorhub2_sensor1, &rx_sensorhub2_sensor1,
@@ -406,7 +406,7 @@ int can_transport_init()
     tid = k_thread_create(&rx_sensorhub_sensor2_thread_data, rx_sensorhub_sensor2_thread_stack,
                           K_THREAD_STACK_SIZEOF(rx_sensorhub_sensor2_thread_stack),
                           rx_sensorhub_sensor2_thread, NULL, NULL, NULL,
-                          2, 0, K_NO_WAIT);
+                          1, 0, K_NO_WAIT);
     if (!tid)
     {
         printk("ERROR spawning rx thread\n");

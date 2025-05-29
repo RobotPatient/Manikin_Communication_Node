@@ -27,6 +27,7 @@ target_sources(app PRIVATE
   src/ble/crc/crc16_koopman_hw.c
   src/session/session.c
   src/sdcard/sdcard_module.c
+  src/session/led_handler.c
   )
 
 # Add Bluetooth sample includes for reference

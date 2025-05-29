@@ -14,6 +14,7 @@
 
 LOG_MODULE_REGISTER(notif_manager, CONFIG_LOG_DEFAULT_LEVEL);
 
+
 /* Size of notification queue from Kconfig */
 #define QUEUE_SIZE CONFIG_CPR_MANIKIN_BLE_NOTIFICATION_QUEUE_SIZE
 #define MAX_RETRIES CONFIG_CPR_MANIKIN_MAX_NOTIFICATION_RETRY
@@ -276,7 +277,7 @@ int notification_manager_init(const struct bt_gatt_attr *chr)
     k_work_init_delayable(&notify_work, notify_work_handler);
     
     LOG_INF("Notification manager initialized (queue size: %d)", QUEUE_SIZE);
-    
+  
     return 0;
 }
 
@@ -432,3 +433,5 @@ bool notification_manager_has_memory_pressure(void)
     
     return has_pressure;
 }
+
+
