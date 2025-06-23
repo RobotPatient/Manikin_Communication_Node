@@ -4,7 +4,7 @@
 #include "can_addr_decl.h"
 #include "can_rx_types.h"
 #include <session/session.h>
-
+#include <zephyr/drivers/uart.h>
 
 #define CAN_CMD_LEN 1 // start/stop are single-byte
 #define SYSTEM_CMD_STOP 0
@@ -25,6 +25,7 @@ struct isotp_recv_ctx recv_ctx_sensorhub1_sensor3;
 
 struct isotp_recv_ctx recv_ctx_sensorhub2_cmd;
 struct isotp_recv_ctx recv_ctx_sensorhub2_sensor1;
+static const struct device *const uart_dev = DEVICE_DT_GET_ONE(zephyr_cdc_acm_uart);
 
 K_THREAD_STACK_DEFINE(rx_sensorhub_sensor1_thread_stack, 1024);
 K_THREAD_STACK_DEFINE(rx_sensorhub_sensor2_thread_stack, 1024);
@@ -97,7 +98,7 @@ void can_transmit_stop_msg() {
     };
     can_send(can_dev, &stop_frame, K_MSEC(2), NULL, NULL);
 }
-
+char bhi360_line[256];
 sample_sensor4_t bhi360_fusion_sample;
 void rx_sensorhub2_sensor1_thread(void *arg1, void *arg2, void *arg3)
 {
@@ -136,6 +137,8 @@ void rx_sensorhub2_sensor1_thread(void *arg1, void *arg2, void *arg3)
             printk("Pitch: %f deg\n", bhi360_fusion_sample.data.pitch_deg);
             printk("Roll: %f deg\n", bhi360_fusion_sample.data.roll_deg);
             printk("Yaw: %f deg\n", bhi360_fusion_sample.data.yaw_deg);
+            size_t len = snprintf(bhi360_line, sizeof(bhi360_line), "BHI360FUS, %d, %f, %f, %f\n", bhi360_fusion_sample.frame_id, bhi360_fusion_sample.data.pitch_deg, bhi360_fusion_sample.data.roll_deg, bhi360_fusion_sample.data.yaw_deg);
+            uart_fifo_fill(uart_dev, bhi360_line, len);
         }
         else
         {

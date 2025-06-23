@@ -26,3 +26,6 @@
 &fdcan1 {
     status = "okay";
 };
+&sdmmc1{
+    status = "okay";
+};

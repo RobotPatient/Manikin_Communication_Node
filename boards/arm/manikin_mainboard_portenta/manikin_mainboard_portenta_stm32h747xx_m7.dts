@@ -187,12 +187,27 @@
 		 };
 	 };
  };
- 
+
  &sdmmc2 {
     bus-width = <4>;
     pinctrl-0 = <&sdmmc2_d0_pb14 &sdmmc2_d1_pb15 &sdmmc2_d2_pb3 &sdmmc2_d3_pb4 &sdmmc2_ck_pd6 &sdmmc2_cmd_pd7>;
     pinctrl-names = "default";
 	status = "okay";
 	clk-div = <1>; 
+	disk-name = "SD";
 	idma;
+};
+
+&sdmmc1 {
+    pinctrl-0 = <&sdmmc1_d0_pc8 &sdmmc1_d1_pc9 &sdmmc1_d2_pc10 &sdmmc1_d3_pc11 &sdmmc1_ck_pc12 &sdmmc1_cmd_pd2>;
+	pinctrl-names = "default";
+	status = "okay";
+	airoc-wifi {
+      status = "okay";
+      compatible = "infineon,airoc-wifi";
+
+      /* Wi-Fi control gpios */
+      wifi-reg-on-gpios    = <&gpioa 6 GPIO_ACTIVE_HIGH>;
+      wifi-host-wake-gpios = <&gpioa 4 GPIO_ACTIVE_HIGH>;
+    };
 };

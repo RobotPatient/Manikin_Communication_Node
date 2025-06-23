@@ -123,13 +123,14 @@ void write_to_session_file(char *csv_formatted_text, size_t length)
 
     if (k_msgq_put(&csv_msgq, csv_formatted_text, K_NO_WAIT) != 0)
         printk("CSV queue full, dropping sample\n");
-
-    if (k_msgq_put(&csv_usb_msgq, csv_formatted_text, K_NO_WAIT) != 0)
-        printk("CSV USB queue full, dropping sample\n");
 }
 
 void write_vl_to_session_file(sample_sensor1_t *vl_samples, uint8_t num)
 {
+    if (!cpr_session_active)
+    {
+        return;
+    }
     for (uint8_t i = 0; i < num; i++)
     {
         memset(csv_buffer, 0x00, sizeof(csv_buffer));
@@ -139,11 +140,18 @@ void write_vl_to_session_file(sample_sensor1_t *vl_samples, uint8_t num)
                               vl_samples[i].frame_id,
                               vl_samples[i].data.distance_mm);
         write_to_session_file(csv_buffer, len);
+
+        if (k_msgq_put(&csv_usb_msgq, csv_buffer, K_NO_WAIT) != 0)
+            printk("CSV USB queue full, dropping sample\n");
     }
 }
 
 void write_ads_to_session_file(sample_sensor2_t *ads_samples, uint8_t num)
 {
+    if (!cpr_session_active)
+    {
+        return;
+    }
     for (uint8_t i = 0; i < num; i++)
     {
         memset(csv_buffer, 0x00, sizeof(csv_buffer));
@@ -160,11 +168,17 @@ void write_ads_to_session_file(sample_sensor2_t *ads_samples, uint8_t num)
                               ads_samples[i].data.ch7_mv,
                               ads_samples[i].data.ch8_mv);
         write_to_session_file(csv_buffer, len);
+        if (k_msgq_put(&csv_usb_msgq, csv_buffer, K_NO_WAIT) != 0)
+            printk("CSV USB queue full, dropping sample\n");
     }
 }
 
 void write_sdp_to_session_file(sample_sensor3_t *sdp_samples, uint8_t num)
 {
+    if (!cpr_session_active)
+    {
+        return;
+    }
     for (uint8_t i = 0; i < num; i++)
     {
         memset(csv_buffer, 0x00, sizeof(csv_buffer));
@@ -175,11 +189,17 @@ void write_sdp_to_session_file(sample_sensor3_t *sdp_samples, uint8_t num)
                               (double)sdp_samples[i].data.pressure,
                               (double)sdp_samples[i].data.temp);
         write_to_session_file(csv_buffer, len);
+        if (k_msgq_put(&csv_usb_msgq, csv_buffer, K_NO_WAIT) != 0)
+            printk("CSV USB queue full, dropping sample\n");
     }
 }
 
 void write_bhi_to_session_file(sample_sensor4_t *bhi_samples, uint8_t num)
 {
+    if (!cpr_session_active)
+    {
+        return;
+    }
     for (uint8_t i = 0; i < num; i++)
     {
         memset(csv_buffer, 0x00, sizeof(csv_buffer));
